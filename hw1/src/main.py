@@ -18,8 +18,10 @@ class EncoderDecoderNet(nn.Module):
         self.encoder = nn.Sequential(
             nn.Linear(3, 16,dtype=torch.float32),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(16, 8),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(8, 5),
             nn.ReLU()
         )
@@ -27,8 +29,10 @@ class EncoderDecoderNet(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(5, 8),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(8, 16),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(16, 3)
         )
 
@@ -48,7 +52,7 @@ alpha3 = (-np.pi, np.pi)
 
 def generate_data():
     
-    dataset_size = 1*10**2
+    dataset_size = 1*10**6
     l1 = -14
     l2 = 14.5
     l3 = -2.7 
@@ -84,8 +88,64 @@ def generate_data():
     # F_Train = torch.from_numpy(F_Train).to(torch.float32).to(device)
     return F_Train
 
+# Example Δu_max values from Table 1 (tune as needed)
+# delta_u_max = torch.tensor([500.0, 250.0, 250.0, 0.1, 0.1], device=device)
+delta_u_max = torch.tensor([1000.0, 1000.0, 1000.0,  np.deg2rad(10.0), np.deg2rad(10.0)], device=device)
+
 def rateChangeLoss(u_actual):
-    return 0
+    """
+    Penalize large rate changes in encoded commands.
+    u_actual: (batch_size, 5) encoder outputs
+    """
+    # shift along batch dimension (dim=0)
+    u_shifted = torch.roll(u_actual, shifts=1, dims=0)
+    u_shifted[0, :] = u_actual[0, :]  # prevent wrap-around
+   
+    # absolute rate change
+    rate_diff = torch.abs(u_actual - u_shifted)
+   
+    # apply thresholds per variable
+    penalty = torch.clamp(rate_diff - delta_u_max, min=0.0)
+   
+    # L3 loss: 4 * mean over batch & variables
+    L3 = 4.0 * penalty.mean()
+    return L3
+
+def powerConsumptionLoss(u_actual):
+    """
+    Penalize power consumption: sum |u|^(3/2) for indices 0, 1, and 3.
+    u_actual: (batch_size, 5) encoder outputs
+    """
+    # Select indices 0, 1, 3
+    selected = u_actual[:, [0, 1, 3]]
+    # Compute |u|^(3/2)
+    power_terms = torch.abs(selected) ** 1.5
+    # L4 = mean over batch & selected variables
+    L4 = power_terms.mean()
+    return L4
+# disallowed azimuth sectors in radians
+sector1 = (-100.0 * np.pi/180.0, -80.0 * np.pi/180.0)
+sector2 = (  80.0 * np.pi/180.0, 100.0 * np.pi/180.0)
+ 
+def azimuthSectorLoss(u_actual):
+    """
+    Penalize azimuth angles of T2 (idx=2) and T3 (idx=4) if they fall into disallowed sectors.
+    """
+    # select azimuth indices
+    azimuths = u_actual[:, [2, 4]]
+ 
+    # condition: inside sector1
+    in_sector1 = ((azimuths > sector1[0]) & (azimuths < sector1[1])).float()
+ 
+    # condition: inside sector2
+    in_sector2 = ((azimuths > sector2[0]) & (azimuths < sector2[1])).float()
+ 
+    # total violation = sum of both
+    violation = in_sector1 + in_sector2
+ 
+    # L5 = mean over batch & both azimuths
+    L5 = violation.mean()
+    return L5
 
 def custom_loss(model, output, target):
     L1 = nn.MSELoss()(output, target)
@@ -94,7 +154,9 @@ def custom_loss(model, output, target):
     # Thruster Command Magnitude Limits Loss
     L2 = thrusterCommandMagnitude(u_actual)
     L3 = rateChangeLoss(u_actual)
-    return L1+L2+L3
+    L4 = powerConsumptionLoss(u_actual)
+    L5 = azimuthSectorLoss(u_actual)
+    return L1+L2+L3+L4+L5
 
 def thrusterCommandMagnitude(u_actual):
     result = torch.clamp(abs(u_actual[:,0])-F1[1], min=0)
@@ -133,10 +195,6 @@ def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate
                 best_loss = loss.item()
                 best_loss_epoch = epoch
                 torch.save(model.state_dict(), 'best_model.pth')
-            # else:
-            #     if epoch > best_loss_epoch+200:
-            #         print(f"Early stopping at epoch {epoch}")
-            #         break
             loss.backward()
             optimizer.step()
         avg_train_loss = running_train_loss / train_count
@@ -159,6 +217,9 @@ def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate
 
         if avg_test_loss < avg_train_loss:
             lossCounter += 1
+        else:
+            lossCounter = 0
+
         if lossCounter > 200:
             print(f"Early stopping at epoch {epoch}")
             break
@@ -190,22 +251,32 @@ def evaluate_loss(model, data_loader):
     avg_loss = total_loss / count
     return avg_loss
 
+batch_size = 100000
 # Example usage
 if __name__ == "__main__":
     
-    sample_data = generate_data()
+    import os
+    file_name = "data_sample.npy"
+    if os.path.exists(file_name):
+        with open(file_name, "rb") as f:
+            sample_data = np.load(f)
+    else:
+        sample_data = generate_data()
+        np.save("data_sample.npy", sample_data,allow_pickle=True)
+        
+
     sample_data_tensor = torch.from_numpy(sample_data).to(torch.float32).to(device)
     
-    inputs = sample_data_tensor[:, :3]
-    targets=sample_data_tensor[:,:3]
+    inputs  = sample_data_tensor[:, :3]
+    targets = sample_data_tensor[:,:3]
     
     train_inputs, test_inputs, train_targets, test_targets = train_test_split(
         inputs, targets, test_size=0.2, random_state=42)
 
     train_dataset = torch.utils.data.TensorDataset(train_inputs, train_targets)
     test_dataset = torch.utils.data.TensorDataset(test_inputs, test_targets)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size)
 
     model = EncoderDecoderNet().to(device)
     train_model(model, train_loader, test_loader)
