@@ -179,6 +179,7 @@ def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate
     train_losses = []
     test_losses = []
     lossCounter = 0
+    best_test_loss = float('inf')
     for epoch in range(num_epochs):
         model.train()
         running_train_loss = 0.0
@@ -213,14 +214,22 @@ def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate
                 running_test_loss += test_loss.item() * inputs.size(0)
                 test_count += inputs.size(0)
         avg_test_loss = running_test_loss / test_count
+        
+        if avg_test_loss < best_test_loss:
+            best_test_loss = avg_test_loss
+            best_test_epoch = epoch
+        else:
+            if epoch - best_test_epoch > 5:
+                print(f"Early stopping at epoch {epoch}")
+                break
         test_losses.append(avg_test_loss)
 
-        if avg_test_loss < avg_train_loss:
+        if avg_test_loss > avg_train_loss:
             lossCounter += 1
         else:
             lossCounter = 0
 
-        if lossCounter > 200:
+        if lossCounter > 5:
             print(f"Early stopping at epoch {epoch}")
             break
         if epoch % 10 == 0:
