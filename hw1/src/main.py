@@ -16,21 +16,21 @@ class EncoderDecoderNet(nn.Module):
         # Encoder: 3 inputs -> 16 -> 8 -> 5
         self.encoded = None
         self.encoder = nn.Sequential(
-            nn.Linear(3, 16,dtype=torch.float32),
+            nn.Linear(3, 64,dtype=torch.float32),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(16, 8),
+            nn.Linear(64, 16),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(8, 5),
+            nn.Linear(16, 5),
             nn.ReLU()
         )
         # Decoder: 5 -> 8 -> 16 -> 3 outputs
         self.decoder = nn.Sequential(
-            nn.Linear(5, 8),
+            nn.Linear(5, 64),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(8, 16),
+            nn.Linear(64, 16),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(16, 3)
