@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import math
 
 # Create data folder if it doesn't exist
 os.makedirs('data', exist_ok=True)
@@ -126,12 +128,13 @@ def train_entire_model(model, train_loader, val_loader, criterion, num_epochs=5,
 
 
 # Test set evaluation
-def evaluate_on_test(model, test_loader, num_images=None, class_names=None):
+def evaluate_on_test(model, test_loader, num_images=None, class_names=None, output_grid_path=None):
     model.eval()
     processed = 0
+    images_list = []
+    preds_list = []
     with torch.no_grad():
         for batch in test_loader:
-            # If test_loader returns (images, labels), ignore labels
             if isinstance(batch, (list, tuple)) and len(batch) == 2:
                 images = batch[0]
             else:
@@ -144,21 +147,23 @@ def evaluate_on_test(model, test_loader, num_images=None, class_names=None):
                 images = images[:batch_size]
             images = images.to(device)
             outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-            # Plot each image with prediction only
+            probs = torch.softmax(outputs, dim=1)
+            _, predicted = torch.max(probs, 1)
             for i in range(batch_size):
                 img = images[i].cpu()
-                # Unnormalize for display
                 img = img * torch.tensor([0.229, 0.224, 0.225]).view(3,1,1) + torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
                 img = img.clamp(0,1)
                 img_np = img.permute(1,2,0).numpy()
                 pred_label = predicted[i].item()
                 pred_name = class_names[pred_label] if class_names else str(pred_label)
+                pred_prob = probs[i][pred_label].item()
+                images_list.append(img_np)
+                preds_list.append(f'{pred_name} ({pred_prob:.2f})')
+                # Save individual plot to disk
                 plt.figure()
                 plt.imshow(img_np)
-                plt.title(f'Predicted: {pred_name}')
+                plt.title(f'Predicted: {pred_name} ({pred_prob:.2f})')
                 plt.axis('off')
-                # Save plot to disk
                 os.makedirs('test_predictions', exist_ok=True)
                 plot_path = f'test_predictions/img_{processed}_pred_{pred_name}.png'
                 plt.savefig(plot_path)
@@ -172,6 +177,22 @@ def evaluate_on_test(model, test_loader, num_images=None, class_names=None):
         print('No test images processed.')
         return
     print(f'Inference complete. Saved {processed} prediction plots.')
+    # Create a grid of all images and predictions
+    if output_grid_path is not None and len(images_list) > 0:
+        cols = min(5, len(images_list))
+        rows = math.ceil(len(images_list) / cols)
+        fig = plt.figure(figsize=(4*cols, 4*rows))
+        gs = gridspec.GridSpec(rows, cols)
+        for idx, (img, pred) in enumerate(zip(images_list, preds_list)):
+            ax = fig.add_subplot(gs[idx])
+            ax.imshow(img)
+            ax.set_title(f'Predicted: {pred}')
+            ax.axis('off')
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(output_grid_path), exist_ok=True)
+        plt.savefig(output_grid_path)
+        plt.close()
+        print(f'Grid screenshot saved to {output_grid_path}')
 
 
 def main():
@@ -194,13 +215,19 @@ def main():
         train_entire_model(resnet, train_loader, val_loader, criterion, num_epochs=args.epochs, patience=args.patience, save_path=args.save_path)
     elif args.mode == 'test':
         print('Running inference on test images...')
-        # Load saved model weights before inference
+        # Run with current model weights
+        grid_path_current = './hw2/docs/test_predictions_grid_current.png'
+        print('Grid with current model weights:')
+        evaluate_on_test(resnet, test_loader, num_images=args.num_images, class_names=class_names, output_grid_path=grid_path_current)
+        # Run with best saved model weights
         if os.path.exists(args.save_path):
             resnet.load_state_dict(torch.load(args.save_path, map_location=device))
             print(f'Loaded model weights from {args.save_path}')
         else:
             print(f'Warning: Model weights file {args.save_path} not found. Using current model weights.')
-        evaluate_on_test(resnet, test_loader, num_images=args.num_images, class_names=class_names)
+        grid_path_best = './hw2/docs/test_predictions_grid_best.png'
+        print('Grid with best saved model weights:')
+        evaluate_on_test(resnet, test_loader, num_images=args.num_images, class_names=class_names, output_grid_path=grid_path_best)
 
 if __name__ == '__main__':
     main()
