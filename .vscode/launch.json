@@ -9,7 +9,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/hw2/src/hw2_main.py",
-            "args": ["--mode", "finetune", "--epochs", "5"],
+            "args": ["--mode", "finetune", "--epochs", "5", "--patience", "3", "--save_path", "best_finetune_model.pth"],
             "console": "integratedTerminal"
         },
         {
@@ -17,7 +17,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/hw2/src/hw2_main.py",
-            "args": ["--mode", "train", "--epochs", "5"],
+            "args": ["--mode", "train", "--epochs", "5", "--patience", "3", "--save_path", "best_train_model.pth"],
             "console": "integratedTerminal"
         },
         {
