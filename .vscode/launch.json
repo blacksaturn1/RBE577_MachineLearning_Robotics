@@ -5,6 +5,30 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Fine-tune Last Layer",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/hw2/src/hw2_main.py",
+            "args": ["--mode", "finetune", "--epochs", "5"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train Entire Model",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/hw2/src/hw2_main.py",
+            "args": ["--mode", "train", "--epochs", "5"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test and Save Predictions",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/hw2/src/hw2_main.py",
+            "args": ["--mode", "test", "--num_images", "10"],
+            "console": "integratedTerminal"
+        },
+        {
             "name": "Python Debugger: Current File",
             "type": "debugpy",
             "request": "launch",
