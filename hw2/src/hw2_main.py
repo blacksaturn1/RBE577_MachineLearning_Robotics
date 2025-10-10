@@ -181,7 +181,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=5, help='Number of epochs for training')
     parser.add_argument('--num_images', type=int, default=10, help='Number of test images to evaluate')
     parser.add_argument('--patience', type=int, default=3, help='Early stopping patience')
-    parser.add_argument('--save_path', type=str, default='best_model.pth', help='Path to save best model')
+    parser.add_argument('--save_path', type=str, default='best_finetune_model.pth', help='Path to save best model')
     args = parser.parse_args()
 
     class_names = val_dataset.classes
