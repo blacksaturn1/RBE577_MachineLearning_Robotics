@@ -16,10 +16,10 @@ class EncoderDecoderNet(nn.Module):
         # Encoder: 3 inputs -> 16 -> 8 -> 5
         self.encoded = None
         self.encoder = nn.Sequential(
-            nn.Linear(3, 64,dtype=torch.float32),
+            nn.Linear(3, 32,dtype=torch.float32),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(64, 16),
+            nn.Linear(32, 16),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(16, 5),
@@ -27,10 +27,10 @@ class EncoderDecoderNet(nn.Module):
         )
         # Decoder: 5 -> 8 -> 16 -> 3 outputs
         self.decoder = nn.Sequential(
-            nn.Linear(5, 64),
+            nn.Linear(5, 32),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(64, 16),
+            nn.Linear(32, 16),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(16, 3)
@@ -52,7 +52,7 @@ alpha3 = (-np.pi, np.pi)
 
 def generate_data():
     
-    dataset_size = 1*10**6
+    dataset_size = 10**6
     l1 = -14
     l2 = 14.5
     l3 = -2.7 
@@ -62,11 +62,15 @@ def generate_data():
     start = time.time()
     for i in range(dataset_size):
         F1_r = random.normalvariate(F1[0], F1[1])
+        
         F2_r = random.normalvariate(F2[0], F2[1])
+        
         F3_r = random.normalvariate(F3[0], F3[1])
+        
         alpha2_r = random.normalvariate(alpha2[0], alpha2[1])
+        
         alpha3_r = random.normalvariate(alpha3[0], alpha3[1])
-
+        
         tau = [
                 [0., np.cos(alpha2_r), np.cos(alpha3_r)],
                 [1., np.sin(alpha2_r), np.sin(alpha3_r)],
@@ -77,6 +81,23 @@ def generate_data():
         F = np.array([F1_r, F2_r, F3_r],dtype=float)
         
         res = np.matmul(tau, F)
+        # scale the results to roughly -1 to 1
+        res[0] = res[0] / 15000.0
+        res[1] = res[1] / 15000.0
+        res[2] = res[2] / 40000.0
+        
+        # Normalize F1_r to range [0, 1]
+        F1_r = (F1_r - F1[0]) / (F1[1] - F1[0])
+        
+        # Normalize F2_r to range [0, 1]
+        F2_r = (F2_r - F2[0]) / (F2[1] - F2[0])
+        
+        # Normalize F3_r to range [0, 1]
+        F3_r = (F3_r - F3[0]) / (F3[1] - F3[0])
+        
+        # Normalize alpha2_r to range [0, 1]
+        alpha2_r = (alpha2_r - alpha2[0]) / (alpha2[1] - alpha2[0])
+        alpha3_r = (alpha3_r - alpha3[0]) / (alpha3[1] - alpha3[0])
         
         F_Data = np.hstack(([F1_r, F2_r, F3_r,alpha2_r,alpha3_r],res),dtype=float)
         F_Train.append(F_Data)
@@ -147,16 +168,16 @@ def azimuthSectorLoss(u_actual):
     L5 = violation.mean()
     return L5
 
-def custom_loss(model, output, target):
-    L1 = nn.MSELoss()(output, target)
+def custom_loss(output, target):
+    #L1 = nn.MSELoss()(output, target)
     # Add your custom logic, e.g., regularization or extra terms
-    u_actual=model.getEncoded()
+    u_actual=output[:,:5]
     # Thruster Command Magnitude Limits Loss
     L2 = thrusterCommandMagnitude(u_actual)
     L3 = rateChangeLoss(u_actual)
     L4 = powerConsumptionLoss(u_actual)
     L5 = azimuthSectorLoss(u_actual)
-    return L1+L2+L3+L4+L5
+    return L2+L3+L4+L5
 
 def thrusterCommandMagnitude(u_actual):
     result = torch.clamp(abs(u_actual[:,0])-F1[1], min=0)
@@ -172,10 +193,14 @@ def thrusterCommandMagnitude(u_actual):
     return L2
 
 # Example training loop for EncoderDecoderNet
-def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate=0.001):
+def train_model(model, train_loader, test_loader, num_epochs=100, learning_rate=0.001):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    encoder_optimizer = torch.optim.Adam(model.encoder.parameters(), lr=learning_rate)
+    #encoder_loss_fn = nn.MSELoss()
+    main_loss_fn = nn.MSELoss()
     best_loss = float('inf')
-    best_loss_epoch = -1
+    
+    best_training_epoch = -1
     train_losses = []
     test_losses = []
     lossCounter = 0
@@ -188,16 +213,25 @@ def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate
             inputs = inputs.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
+            encoder_optimizer.zero_grad()
             outputs = model(inputs)
-            loss = custom_loss(model,outputs, targets)
-            running_train_loss += loss.item() * inputs.size(0)
+            # Main loss (autoencoder)
+            L1_loss = main_loss_fn(outputs, targets[:,:3])
+            # Encoder-specific loss (example: try to make encoded output close to zero vector)
+            # encoded = model.getEncoded()
+            encoderOutput = model.encoder(inputs)
+            encoder_loss = custom_loss(encoderOutput, targets[:,3:8])
+            # Combine losses as needed (here, just for demonstration, you can weight them)
+            total_loss = L1_loss + 0.5 * encoder_loss
+            running_train_loss += total_loss.item() * inputs.size(0)
             train_count += inputs.size(0)
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                best_loss_epoch = epoch
+            if total_loss.item() < best_loss:
+                best_loss = total_loss.item()
+                best_training_epoch = epoch
                 torch.save(model.state_dict(), 'best_model.pth')
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
+            encoder_optimizer.step()
         avg_train_loss = running_train_loss / train_count
         train_losses.append(avg_train_loss)
 
@@ -210,18 +244,23 @@ def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate
                 inputs = inputs.to(device)
                 targets = targets.to(device)
                 outputs = model(inputs)
-                test_loss = custom_loss(model,outputs, targets)
+                
+                # Main loss (autoencoder)
+                L1_loss = main_loss_fn(outputs, targets[:,:3])
+                
+                # Encoder-specific loss (example: try to make encoded output close to zero vector)
+                encoderOutput = model.encoder(inputs)
+                encoder_loss = custom_loss(encoderOutput, targets[:,3:8])
+                
+                # Combine losses as needed (here, just for demonstration, you can weight them)
+                test_loss = L1_loss + 0.5 * encoder_loss
                 running_test_loss += test_loss.item() * inputs.size(0)
                 test_count += inputs.size(0)
         avg_test_loss = running_test_loss / test_count
         
-        if avg_test_loss < best_test_loss:
-            best_test_loss = avg_test_loss
-            best_test_epoch = epoch
-        else:
-            if epoch - best_test_epoch > 5:
-                print(f"Early stopping at epoch {epoch}")
-                break
+        if epoch - best_training_epoch > 20:
+            print(f"Early stopping for learning stability at epoch {epoch}")
+            break
         test_losses.append(avg_test_loss)
 
         if avg_test_loss > avg_train_loss:
@@ -229,14 +268,14 @@ def train_model(model, train_loader, test_loader, num_epochs=1000, learning_rate
         else:
             lossCounter = 0
 
-        if lossCounter > 5:
-            print(f"Early stopping at epoch {epoch}")
+        if lossCounter > 20:
+            print(f"Early stopping for overfitting at epoch {epoch}")
             break
-        if epoch % 10 == 0:
+        if epoch % 1 == 0:
             print(f"Epoch {epoch}, Train Loss: {avg_train_loss}, Test Loss: {avg_test_loss}")
 
     # Plot losses after training
-    print(f"Best Loss: {best_loss} at epoch {best_loss_epoch}")
+    print(f"Best Loss: {best_loss} at epoch {best_training_epoch}")
     plt.figure(figsize=(10,5))
     plt.plot(train_losses, label='Train Loss')
     plt.plot(test_losses, label='Test Loss')
@@ -260,7 +299,7 @@ def evaluate_loss(model, data_loader):
     avg_loss = total_loss / count
     return avg_loss
 
-batch_size = 100000
+batch_size = 1024
 # Example usage
 if __name__ == "__main__":
     
@@ -277,7 +316,7 @@ if __name__ == "__main__":
     sample_data_tensor = torch.from_numpy(sample_data).to(torch.float32).to(device)
     
     inputs  = sample_data_tensor[:, :3]
-    targets = sample_data_tensor[:,:3]
+    targets = sample_data_tensor[:,:8]
     
     train_inputs, test_inputs, train_targets, test_targets = train_test_split(
         inputs, targets, test_size=0.2, random_state=42)
@@ -291,8 +330,23 @@ if __name__ == "__main__":
     train_model(model, train_loader, test_loader)
     data = torch.tensor(test_dataset[0][0],dtype=torch.float32).to(device)
     output = model(data)
+
     print(output.device)
+    torch.set_printoptions(sci_mode=False, precision=1)
     print("Input:", test_dataset[0][0])
+    # Uncomment to see unnormalized input
+    test_dataset_np = test_dataset[0][0].cpu().detach().numpy()
+    
+    test_dataset_np[0] = test_dataset_np[0] * 15000.0
+    test_dataset_np[1] = test_dataset_np[1] * 15000.0
+    test_dataset_np[2] = test_dataset_np[2] * 40000
+    
+    # Unnormalize output back to original scale
+    output_np = output.cpu().detach().numpy()
+    output_np[0] = output_np[0] * 15000.0
+    output_np[1] = output_np[1] * 15000.0
+    output_np[2] = output_np[2] * 40000
+    
     print("Decoded Output:", output)
     print("Actual Output:", test_dataset[0][1])
     print("Output shape:", output.shape)
