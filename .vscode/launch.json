@@ -5,29 +5,38 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Fine-tune Last Layer",
+            "name": "HW2: Fine-tune Last Layer",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/hw2/src/hw2_main.py",
-            "args": ["--mode", "finetune", "--epochs", "5", "--patience", "3", "--save_path", "best_finetune_model.pth"],
+            "args": ["--mode", "finetune", "--epochs", "10", "--patience", "3", "--save_path", "best_finetune_model.pth"],
             "console": "integratedTerminal"
         },
         {
-            "name": "Train Entire Model",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/hw2/src/hw2_main.py",
-            "args": ["--mode", "train", "--epochs", "5", "--patience", "3", "--save_path", "best_train_model.pth"],
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Test and Save Predictions",
+            "name": "HW2: Test and Save Predictions on Fine Tuned Model",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/hw2/src/hw2_main.py",
             "args": ["--mode", "test", "--num_images", "10","--save_path", "best_finetune_model.pth"],
             "console": "integratedTerminal"
         },
+        {
+            "name": "HW2: Train Entire Model",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/hw2/src/hw2_main.py",
+            "args": ["--mode", "train", "--epochs", "100", "--patience", "3", "--save_path", "best_full_trained_model.pth"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "HW2: Test and Save Predictions on Fully Trained Model",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/hw2/src/hw2_main.py",
+            "args": ["--mode", "test", "--num_images", "10","--save_path", "best_full_trained_model.pth"],
+            "console": "integratedTerminal"
+        }
+        ,
         {
             "name": "Python Debugger: Current File",
             "type": "debugpy",

@@ -123,7 +123,7 @@ def fine_tune_last_layer(model, train_loader, val_loader, criterion, num_epochs=
 def train_entire_model(model, train_loader, val_loader, criterion, num_epochs=5, patience=3, save_path='best_model.pth'):
     for param in model.parameters():
         param.requires_grad = True
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, patience=patience, save_path=save_path)
 
 
