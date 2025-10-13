@@ -6,6 +6,12 @@ Date: October 2025
 
 ---
 
+## Summary
+
+This project explores transfer learning for image classification using a deep neural network (ResNet152) pretrained on ImageNet. The pipeline supports flexible training, early stopping, and robust inference on raw test images. Results are visualized with prediction probabilities, and the workflow is designed for reproducibility and extensibility.
+
+---
+
 ## Methodology
 
 This project implements an image classification pipeline using a deep convolutional neural network, ResNet152, pretrained on ImageNet. The workflow includes:
@@ -20,12 +26,9 @@ This project implements an image classification pipeline using a deep convolutio
   - The model is transferred to GPU if available.
 
 - **Training Procedure:**
-  - Two modes: fine-tuning only the last layer, or training the entire model.
-  - Adam optimizer is used for both modes.
-  - Cross-entropy loss is used for classification.
-  - Early stopping is implemented with a patience parameter to prevent overfitting.
-  - The best model (lowest validation loss) is saved during training.
-  - Training and validation loss/accuracy are logged to TensorBoard.
+  - The training procedure supports two modes: fine-tuning only the last layer, or training the entire model. For both approaches, the Adam optimizer is used and cross-entropy loss is applied for classification. The code uses torchvision.transforms.Compose for resizing, tensor conversion, and normalization — consistent with ImageNet preprocessing. The ImageFolder loader automatically maps subfolder names to class indices. Early stopping is implemented with a configurable patience parameter to prevent overfitting, and the best model (lowest validation loss) is automatically saved during training. Throughout the process, training and validation loss/accuracy are logged to TensorBoard for visualization and analysis. A custom generator function (test_image_loader) efficiently loads raw test images without requiring labels, supporting flexible evaluation scenarios.
+
+    Training modes are implemented via two functions: `fine_tune_last_layer()` freezes all pretrained parameters except the final fully connected layer, enabling proper transfer learning, while `train_entire_model()` unfreezes all parameters for end-to-end retraining. Both functions call `train_model()` internally with an Adam optimizer at a learning rate of 0.001.
 
 - **Inference and Output:**
   - The model can be run on test images with or without loading the best saved weights.

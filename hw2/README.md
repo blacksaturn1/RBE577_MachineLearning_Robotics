@@ -7,6 +7,13 @@
 - Inference on raw test images (no ground truth required)
 - Individual prediction images and a grid summary with prediction probabilities
 
+## Methodology
+- Images are resized to 224x224 and normalized using ImageNet statistics via `torchvision.transforms.Compose`.
+- Training and validation sets use `ImageFolder`, which maps subfolder names to class indices.
+- Test images are loaded as raw files using a custom generator, supporting flexible evaluation without ground truth labels.
+- Two training modes: `fine_tune_last_layer()` (freezes all but the last layer for transfer learning) and `train_entire_model()` (unfreezes all layers for end-to-end retraining). Both use Adam optimizer at lr=0.001 and call `train_model()`.
+- The training loop performs batch-wise forward/backward passes, accumulates loss/accuracy, logs metrics to TensorBoard, tracks validation performance, implements early stopping, and saves the best model checkpoint.
+
 ## Usage
 
 ### Install requirements
