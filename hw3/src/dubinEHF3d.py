@@ -37,7 +37,7 @@ def dubinEHF3d(east1, north1, alt1, psi1, east2, north2, r, step, gamma):
     d2c_r = np.sqrt(d2c_r_sq)
 
     if d2c_l < r or d2c_r < r:
-        print("No solution: Distance to goal is less than turn radius.")
+        # print("No solution: Distance to goal is less than turn radius.")
         return np.zeros((0, 3)), 0, 0
 
     theta_c_l = np.arctan2(north2-northc_l, east2-eastc_l)

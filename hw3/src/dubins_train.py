@@ -13,40 +13,70 @@ from dubinEHF3d import dubinEHF3d
 # Dataset
 
 class DubinsDataset(Dataset):
-    def __init__(self, num_samples=2500, seq_len=5):
-        self.data = []
-        self.seq_len = seq_len
-        for _ in range(num_samples):
-            traj, cond = self._generate_sample(seq_len)
-            self.data.append({"traj": traj, "cond": cond})
 
-    def _generate_sample(self, seq_len):
+    MAX_GRID = 500  # Spacing for grid search
+    X_Y_SPACE = 10  # Spacing for grid search
+    MAX_YAW = 360  # Maximum yaw angle in degrees
+    MAX_MIN_ANGLE = 30  # Maximum climb angle in degrees
+    YAW_STEP = 10  # Yaw step in degrees
+    MAX_MIN_ANGLE_STEP = 5  # Min angle step in degrees
+    def __init__(self):
+        self.data = []
         
-        x1, y1, alt1 = 0, 0, 0  # Start at origin
-        x2, y2 = 1000, 1000  # Default goal position
-        for _ in range(100000):  # Try up to 100 times to find a valid path
+        self._generate_samples()
+        #self.data.append({"traj": traj, "cond": cond})
+
+    def _try_generate_sample(self, x1, y1, alt1, x2, y2,yaw,gamma):
+        r_min = 100  # Minimum turn radius
+        step_length = 10  # Trajectory discretization step size
+        
+        for _ in range(10):  # Try up to 100 times to find a valid path
             # Random goal x,y
 
-            x2, y2 = np.random.uniform(-3000, 3000, size=(2,))
             # Random start heading
-            start_yaw = np.random.uniform(0., 2.0*np.pi)
-            gamma = np.random.uniform(-30, 30) * np.pi / 180  # Random Climb angle between -15 to 15 degrees
-            # Path parameters
-            step_length = 10  # Trajectory discretization step size
-            r_min = 100  # Minimum turn radius  
             path, psi_end, num_path_points = dubinEHF3d(
-                x1, y1, alt1, start_yaw, x2, y2, r_min, step_length, gamma
+                x1, y1, alt1, yaw, x2, y2, r_min, step_length, gamma
             )
-            if num_path_points <= seq_len:
+            if num_path_points >=1:
                 break
+        if path is None or num_path_points < 2:
+            return None
         traj = path[:num_path_points, :]
-        # # If trajectory is shorter than seq_len, pad with last point
-        # if num_path_points < seq_len:
-        #     pad_length = seq_len - num_path_points
-        #     pad_points = np.tile(traj[-1, :], (pad_length, 1))
-        #     traj = np.vstack([traj, pad_points])
-        return traj.astype(np.float32), np.array([x1, y1, x2, y2], dtype=np.float32)
-    
+        return traj
+
+    def _generate_samples(self):
+        
+        x1, y1, alt1 = 0, 0, 0  # Start at origin
+        x2, y2 = 0.,0.  # Default goal position
+
+        # Check if saved data exists
+        if os.path.exists('dubins_dataset.npy'):
+            print("Loading saved dataset from 'dubins_dataset.npy'")
+            self.data = np.load('dubins_dataset.npy', allow_pickle=True).tolist()
+            print("Loaded {} samples.".format(len(self.data)))
+            return
+        print("Generating new dataset...")
+        # Calculate number of samples
+        num_samples = ((2 * self.MAX_GRID) // self.X_Y_SPACE + 1) ** 2 * \
+                      (self.MAX_YAW // self.YAW_STEP + 1) * \
+                      (2*self.MAX_MIN_ANGLE // self.MAX_MIN_ANGLE_STEP + 1)
+        print(f"Expected number of samples: {num_samples}")
+
+        for x in range(-self.MAX_GRID, self.MAX_GRID+1, self.X_Y_SPACE):
+            for y in range(-self.MAX_GRID, self.MAX_GRID+1, self.X_Y_SPACE):
+                for yaw in range(0, self.MAX_YAW+1, self.YAW_STEP):
+                    for gamma in range(-self.MAX_MIN_ANGLE, self.MAX_MIN_ANGLE+1, self.MAX_MIN_ANGLE_STEP):
+                        yaw_rad = yaw * np.pi / 180.0
+                        gamma_rad = gamma * np.pi / 180.0
+                        traj = self._try_generate_sample(x1, y1, alt1, x, y, yaw_rad, gamma_rad)
+                        if traj is not None and traj.shape[0] > 1:
+                            self.data.append({"traj": traj, "cond": np.array([x1, y1, x, y], dtype=np.float32)})
+            print(f"Generated {len(self.data)} samples so far...")
+        # Save generated data for future use
+        np.save('dubins_dataset.npy', self.data)
+
+        print(f"Generated {len(self.data)} samples.")
+
         # # Random goal x,y
         # x2, y2 = np.random.uniform(-3000, 3000, size=(2,))
         # # Random start heading
@@ -101,8 +131,9 @@ def collate_fn(batch):
         L = t.size(0)
         padded[i, :L, :] = t
 
-    conds = torch.stack(conds).float()
-    padded = padded.float()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    conds = torch.stack(conds).float().to(device=device)
+    padded = padded.float().to(device=device)
     return padded, lengths, conds
 
 # Model
@@ -287,11 +318,14 @@ def plot_prediction_example(model, dataset, device=None, idx=0, seq_len=50):
 
 # Main Training Loop
 
-def main_train(num_samples=2500, seq_len=50, batch_size=64, epochs=30, lr=1e-3, tf_ratio=0.5):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Generating {num_samples} samples...")
-    dataset = DubinsDataset(num_samples=num_samples, seq_len=seq_len)
+def main_train(batch_size=128, epochs=5, lr=1e-2, tf_ratio=0.5,
+               early_stopping_patience: int = 2, early_stopping_min_delta: float = 1e-4):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    print(f"Generating samples...")
+    dataset = DubinsDataset()
     n_train = int(0.8 * len(dataset))
     n_val = len(dataset) - n_train
     train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
@@ -306,6 +340,10 @@ def main_train(num_samples=2500, seq_len=50, batch_size=64, epochs=30, lr=1e-3, 
 
     history = {'train_loss': [], 'val_loss': [], 'ADE': [], 'FDE': []}
 
+    best_val = float('inf')
+    epochs_no_improve = 0
+    best_model_path = 'dubin_lstm_best.pth'
+
     for epoch in range(epochs):
         train_loss = train_epoch(model, train_loader, optim_obj, device, criterion,
                                  teacher_forcing=tf_ratio, clip_grad=2.0)
@@ -316,9 +354,28 @@ def main_train(num_samples=2500, seq_len=50, batch_size=64, epochs=30, lr=1e-3, 
         history['ADE'].append(val_ADE)
         history['FDE'].append(val_FDE)
 
-        print(f"[{epoch+1:02d}/{epochs}] "
-              f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} "
+        print(f"[{epoch+1:02d}/{epochs}] " +
+              f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} " +
               f"| ADE: {val_ADE:.3f} | FDE: {val_FDE:.3f}")
+
+        # Early stopping: save best model and stop when no improvement
+        if val_loss < best_val - early_stopping_min_delta:
+            best_val = val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  Val improved -> saved best model to {best_model_path}")
+        else:
+            epochs_no_improve += 1
+            print(f"  No improvement for {epochs_no_improve} epoch(s)")
+
+        if early_stopping_patience is not None and epochs_no_improve >= early_stopping_patience:
+            print(f"Early stopping triggered (no improvement for {epochs_no_improve} epochs).")
+            break
+
+    # If early stopping was used and a best model exists, load it before final save
+    if os.path.exists(best_model_path):
+        print(f"Loading best model from '{best_model_path}'")
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
 
     torch.save(model.state_dict(), "dubin_lstm.pth")
     print("Training complete. Model saved as 'dubin_lstm.pth'.")
