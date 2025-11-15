@@ -597,8 +597,6 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
 # -----------------------------
 if __name__ == "__main__":
     # To force regeneration: main_train(..., regenerate_dataset=True)
-    logdir = "runs/dubins_lstm"
-    writer = SummaryWriter(log_dir=logdir)
     model, dataset, train_loaders, val_loaders, history = main_train(batch_size=4096, epochs=100, lr=1e-3, 
                                                                      tf_ratio=0.5, regenerate_dataset=False, 
                                                                      early_stopping_patience=3)
