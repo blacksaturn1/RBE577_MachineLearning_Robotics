@@ -98,11 +98,19 @@ class DubinsDataset(Dataset):
     # Generate samples to disk
     # -------------------------
     def _generate_samples(self):
-        # remove old samples/index if present
+
+        # skip generation if index exists
         if os.path.exists(self.INDEX_FILE):
-            print("Removing old index file...")
-            os.remove(self.INDEX_FILE)
-        # optional: wipe sample dir
+            print("Index file already exists; skipping data generation.")
+            return
+
+
+        # # remove old samples/index if present
+        # if os.path.exists(self.INDEX_FILE):
+        #     print("Removing old index file...")
+        #     os.remove(self.INDEX_FILE)
+        # # optional: wipe sample dir
+        
         # WARNING: this will delete existing sample files
         for fname in os.listdir(self.SAMPLES_DIR):
             path = os.path.join(self.SAMPLES_DIR, fname)
@@ -116,7 +124,7 @@ class DubinsDataset(Dataset):
         # buffer for bulk saving; we flush to disk every FLUSH_EVERY samples to avoid high memory use
         archive_buf = {}
         part_idx = 0
-        FLUSH_EVERY = 500
+        FLUSH_EVERY = 500000  # flush samples
         current_part_name = f"all_samples_part{part_idx:03d}.npz"
 
         yaw_values = list(range(0, self.MAX_YAW, self.YAW_STEP))  # e.g., 0..350
@@ -124,10 +132,14 @@ class DubinsDataset(Dataset):
 
         expected = ((2 * self.MAX_GRID) // self.X_Y_SPACE + 1) ** 2 * len(yaw_values) * len(gamma_values)
         print(f"Expected grid samples (upper bound): {expected}")
-
+        debug = False
         # iterate deterministically (non-random)
         for x2 in range(-self.MAX_GRID, self.MAX_GRID + 1, self.X_Y_SPACE):
+            if debug and idx > 100:
+                break
             for y2 in range(-self.MAX_GRID, self.MAX_GRID + 1, self.X_Y_SPACE):
+                if debug and idx > 100:
+                    break
                 for yaw_deg in yaw_values:
                     yaw_rad = yaw_deg * np.pi / 180.0
                     for gamma_deg in gamma_values:
@@ -154,9 +166,9 @@ class DubinsDataset(Dataset):
                         idx += 1
 
                         # flush buffer periodically to avoid large memory usage
-                        if len(archive_buf) >= FLUSH_EVERY:
+                        if idx % FLUSH_EVERY == 0:
                             all_path = os.path.join(self.SAMPLES_DIR, current_part_name)
-                            print(f"Flushing {len(archive_buf)} samples to archive: {all_path}")
+                            print(f"Flushing {idx} samples to archive: {all_path}")
                             np.savez_compressed(all_path, **archive_buf)
                             archive_buf = {}
                             part_idx += 1
@@ -167,9 +179,10 @@ class DubinsDataset(Dataset):
         # Flush any remaining buffered samples into the final part file
         if len(archive_buf) > 0:
             all_path = os.path.join(self.SAMPLES_DIR, current_part_name)
-            print(f"Flushing remaining {len(archive_buf)} samples to archive: {all_path}")
+            print(f"Flushing remaining {len(archive_buf)/5} samples to archive: {all_path}")
             np.savez_compressed(all_path, **archive_buf)
-
+            archive_buf = {}
+            
         # Save index (list of metadata dicts)
         np.save(self.INDEX_FILE, np.array(index_list, dtype=object))
         print(f"Data generation complete. {len(index_list)} samples indexed (split across {part_idx+1} archive files)")
@@ -558,7 +571,9 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
 # -----------------------------
 if __name__ == "__main__":
     # To force regeneration: main_train(..., regenerate_dataset=True)
-    model, dataset, train_loaders, val_loaders, history = main_train(batch_size=128, epochs=1, lr=1e-3, tf_ratio=0.5, regenerate_dataset=False)
+    model, dataset, train_loaders, val_loaders, history = main_train(batch_size=128, epochs=5, lr=1e-3, 
+                                                                     tf_ratio=0.5, regenerate_dataset=False, 
+                                                                     early_stopping_patience=3)
     # Example plot
     # pick a quadrant with at least one sample
     for q in range(4):
