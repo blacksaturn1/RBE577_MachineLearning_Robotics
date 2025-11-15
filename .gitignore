@@ -210,3 +210,5 @@ __marimo__/
 /hw2/src/data/train/
 /hw2/src/data/test/
 /hw2/src/data/val/
+data/
+
