@@ -528,7 +528,7 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
 # -----------------------------
 if __name__ == "__main__":
     # To force regeneration: main_train(..., regenerate_dataset=True)
-    model, dataset, train_loaders, val_loaders, history = main_train(batch_size=128, epochs=10, lr=1e-3, tf_ratio=0.5, regenerate_dataset=False)
+    model, dataset, train_loaders, val_loaders, history = main_train(batch_size=128, epochs=1, lr=1e-3, tf_ratio=0.5, regenerate_dataset=False)
     # Example plot
     # pick a quadrant with at least one sample
     for q in range(4):
