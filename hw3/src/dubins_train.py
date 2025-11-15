@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
 from dubinEHF3d import dubinEHF3d
 
@@ -492,6 +493,13 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
     model = DubinsLSTM().to(device)
     optim_obj = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss(reduction='none')
+    
+    # Create TensorBoard writer with timestamped directory
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%b%d_%H-%M-%S")
+    logdir = f"runs/{timestamp}_dubins_lstm"
+    writer = SummaryWriter(log_dir=logdir)
+    print(f"TensorBoard logs will be saved to: {logdir}")
 
     history = {'train_loss': [], 'val_loss': [], 'ADE': [], 'FDE': []}
     best_val = float('inf')
@@ -542,6 +550,12 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
 
         print(f"[{epoch+1:02d}/{epochs}] Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | ADE: {avg_val_ADE:.4f} | FDE: {avg_val_FDE:.4f}")
 
+        # Log to TensorBoard
+        writer.add_scalar("Loss/Train", avg_train_loss, epoch+1)
+        writer.add_scalar("Loss/Val", avg_val_loss, epoch+1)
+        writer.add_scalar("Metrics/ADE", avg_val_ADE, epoch+1)
+        writer.add_scalar("Metrics/FDE", avg_val_FDE, epoch+1)
+
         if avg_val_loss < best_val - early_stopping_min_delta:
             best_val = avg_val_loss
             epochs_no_improve = 0
@@ -554,6 +568,8 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
         if early_stopping_patience is not None and epochs_no_improve >= early_stopping_patience:
             print(f"Early stopping triggered (no improvement for {epochs_no_improve} epochs).")
             break
+
+    writer.close()   # close TensorBoard writer
 
     # Load best model if exists
     if os.path.exists(best_model_path):
@@ -581,6 +597,8 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
 # -----------------------------
 if __name__ == "__main__":
     # To force regeneration: main_train(..., regenerate_dataset=True)
+    logdir = "runs/dubins_lstm"
+    writer = SummaryWriter(log_dir=logdir)
     model, dataset, train_loaders, val_loaders, history = main_train(batch_size=4096, epochs=100, lr=1e-3, 
                                                                      tf_ratio=0.5, regenerate_dataset=False, 
                                                                      early_stopping_patience=3)
