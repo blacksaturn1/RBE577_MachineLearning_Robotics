@@ -260,6 +260,15 @@ def build_quadrant_loaders(dataset: DubinsDataset, batch_size: int, val_split: f
         q = int(meta["quadrant"])
         quad_indices[q].append(i)
 
+    # remove samples with zero indices
+    for q in quad_indices:
+        quad_indices[q] = [i for i in quad_indices[q] if i != 0]
+    
+    # Limit max samples per quadrant for faster testing
+    max_samples_per_quad = 10000
+    for q in quad_indices:
+        quad_indices[q] = quad_indices[q][:max_samples_per_quad]
+
     train_loaders = []
     val_loaders = []
     train_idx_by_quad = {}
@@ -581,4 +590,4 @@ if __name__ == "__main__":
         if len(train_loaders[q].dataset) > 0:
             sample_global_idx = train_loaders[q].dataset.indices[0]
             plot_prediction_example(model, dataset, idx=sample_global_idx)
-            break
+            
