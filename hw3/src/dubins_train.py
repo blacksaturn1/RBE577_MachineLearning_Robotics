@@ -14,6 +14,10 @@ import argparse
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+from torchinfo import summary
+
+
 try:
     import matplotlib.pyplot as plt
 except Exception:
@@ -191,7 +195,7 @@ class DubinsDataset(Dataset):
         expected = ((2 * self.MAX_GRID) // self.X_Y_SPACE + 1) ** 2 * len(yaw_values) * len(gamma_values)
         print(f"Expected grid samples (upper bound): {expected}")
         debug = True
-        debug_stopping_point = 10000
+        debug_stopping_point = 100000
         stop = False
         # iterate deterministically (non-random)
         for x2 in range(-self.MAX_GRID, self.MAX_GRID + 1, self.X_Y_SPACE):
@@ -698,7 +702,7 @@ def collate_fn(batch):
 # Model (unchanged)
 # -----------------------------
 class DubinsLSTM(nn.Module):
-    def __init__(self, input_dim=3, cond_dim=8, hidden_dim=128, num_layers=2, output_dim=3):
+    def __init__(self, input_dim=3, cond_dim=8, hidden_dim=64, num_layers=6, output_dim=3):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -707,7 +711,8 @@ class DubinsLSTM(nn.Module):
         self.lstm = nn.LSTM(input_dim + hidden_dim, hidden_dim, num_layers, batch_first=True)
         self.fc_out = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, conds, target_seq=None, lengths=None, teacher_forcing_ratio=0.5, seq_len: int = 50):
+    def forward(self, conds, target_seq=None, lengths=None, teacher_forcing_ratio=0.0, 
+                seq_len: int = 50):
         B = conds.size(0)
         device = conds.device
         cond_embed = self.fc_cond(conds)
@@ -752,7 +757,7 @@ def ADE(pred, gt):
 def FDE(pred, gt):
     return torch.mean(torch.norm(pred[:, -1] - gt[:, -1], dim=-1))
 
-def train_epoch(model, loader, optim_obj, device, criterion, teacher_forcing=0.5, clip_grad=1.0):
+def train_epoch(model, loader, optim_obj, device, criterion, teacher_forcing=0.0, clip_grad=1.0):
     model.train()
     running_loss = 0.0
     for trajs, lengths, conds in loader:
@@ -870,6 +875,7 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
     train_loaders, val_loaders, test_loaders, train_idxs, val_idxs, test_idxs = build_quadrant_loaders(dataset, batch_size=batch_size, val_split=0.2, dynamic_batching=dynamic_batching, bucket_size=bucket_size)
 
     model = DubinsLSTM().to(device)
+    summary(model, input_size=(batch_size, 8))
     optim_obj = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss(reduction='none')
 
@@ -1037,8 +1043,8 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train/evaluate Dubins LSTM model")
-    parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--tf-ratio', type=float, default=0.5)
     parser.add_argument('--regenerate', action='store_true')
@@ -1051,7 +1057,7 @@ if __name__ == "__main__":
     parser.add_argument('--model-dir', type=str, default=None, help='Directory to save model artifacts')
 
     args = parser.parse_args()
-    args.regenerate=False
+    args.regenerate=True
     
     model, dataset, train_loaders, val_loaders, test_loaders, history = main(
         batch_size=args.batch_size,
@@ -1061,7 +1067,7 @@ if __name__ == "__main__":
         regenerate_dataset=args.regenerate,
         early_stopping_patience=args.early_stopping_patience,
         evaluate_only=args.evaluate_only,
-        inference_only=True,
+        inference_only=False,
         load_model_path=args.load_model_path,
         dynamic_batching=args.dynamic_batching,
         bucket_size=args.bucket_size,
