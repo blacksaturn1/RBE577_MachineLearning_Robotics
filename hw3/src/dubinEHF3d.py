@@ -1,5 +1,9 @@
 import numpy as np
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+    print("Warning: matplotlib.pyplot not available in dubinEHF3d - plotting disabled.")
 
 def dubinEHF3d(east1, north1, alt1, psi1, east2, north2, r, step, gamma):
     """ Dubin's path calculation for 3D, with end heading free.

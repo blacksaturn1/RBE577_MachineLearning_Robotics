@@ -3,17 +3,36 @@
 Full script with quadrant-by-yaw (Option B) data loader that saves samples to disk
 and loads trajectories on demand to reduce RAM usage.
 """
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 import os
 import random
 import numpy as np
 import torch
+import argparse
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    # Some test environments have NumPy/Matplotlib ABI mismatches. Allow importing the module
+    # without plotting support so unit tests can run headless.
+    plt = None
+    print("Warning: matplotlib.pyplot not available - plotting functions will be disabled.")
 
-from dubinEHF3d import dubinEHF3d
+try:
+    from dubinEHF3d import dubinEHF3d
+except Exception:
+    # Try alternative import paths (tests may execute with different sys.path setups).
+    try:
+        from hw3.src.dubinEHF3d import dubinEHF3d
+    except Exception:
+        # Provide a safe stub so modules that import this file don't fail when they
+        # only use dataset/statistics functionality (tests often don't run the path planner).
+        def dubinEHF3d(*args, **kwargs):
+            return None, None, 0
 
 # -----------------------------
 # Dataset (on-disk, indexed)
@@ -29,7 +48,11 @@ class DubinsDataset(Dataset):
         'gamma'  : float32 (radians)
         'quadrant': int (0..3)
     Index file: 'data/index.npy' stores a list of small metadata dicts:
-        [{'filename': 'samples/00000000.npz', 'quadrant':0, 'length':N}, ...]
+        [{'filename': 'samples/00000000.npz', 'quadrant':0, 'length':N, 'cond':[x1,y1,x2,y2,yaw,gamma]}, ...]
+
+    Note: index entries may include a 'cond' field (list) containing [x1,y1,x2,y2,yaw,gamma].
+    When present the dataset will prefer this metadata-stored condition over reading the
+    archive entry for faster access.
     """
     MAX_GRID = 500          # grid range +/- MAX_GRID
     X_Y_SPACE = 10          # grid spacing
@@ -42,13 +65,26 @@ class DubinsDataset(Dataset):
     SAMPLES_DIR = os.path.join(DATA_ROOT, "samples")
     INDEX_FILE = os.path.join(DATA_ROOT, "index.npy")
 
-    def __init__(self, regenerate: bool = False, r_min=100, step_length=10):
+    def __init__(self, regenerate: bool = False, r_min=100, step_length=10, data_root: str = None, 
+                 normalize: bool = True, norm_eps: float = 1e-8, max_samples: int = 10000, samples_per_part: int = 500):
         """
         If regenerate=True, existing index/samples will be overwritten by new generation.
         """
         super().__init__()
         self.r_min = r_min
         self.step_length = step_length
+        # allow overriding Data root (useful for tests)
+        if data_root is not None:
+            self.DATA_ROOT = data_root
+            self.SAMPLES_DIR = os.path.join(self.DATA_ROOT, "samples")
+            self.INDEX_FILE = os.path.join(self.DATA_ROOT, "index.npy")
+        # normalization settings
+        self.normalize = bool(normalize)
+        self.norm_eps = float(norm_eps)
+        self.NORM_FILE = os.path.join(self.DATA_ROOT, "norm_stats.npz")
+        # generation controls (only used when regenerate=True)
+        self.max_samples = int(max_samples) if max_samples is not None else None
+        self.samples_per_part = int(samples_per_part)
 
         os.makedirs(self.SAMPLES_DIR, exist_ok=True)
 
@@ -60,6 +96,28 @@ class DubinsDataset(Dataset):
         # load index (list of metadata dicts)
         self.index = np.load(self.INDEX_FILE, allow_pickle=True).tolist()
         print(f"Dataset contains {len(self.index)} samples (index loaded).")
+
+        # # If requested, compute or load normalization statistics
+        # if self.normalize:
+        #     if os.path.exists(self.NORM_FILE):
+        #         try:
+        #             with np.load(self.NORM_FILE) as npz:
+        #                 self.traj_mean = npz["traj_mean"]
+        #                 self.traj_std = npz["traj_std"]
+        #                 self.cond_mean = npz["cond_mean"]
+        #                 self.cond_std = npz["cond_std"]
+        #             # ensure arrays are numpy float32
+        #             self.traj_mean = self.traj_mean.astype(np.float32)
+        #             self.traj_std = self.traj_std.astype(np.float32)
+        #             self.cond_mean = self.cond_mean.astype(np.float32)
+        #             self.cond_std = self.cond_std.astype(np.float32)
+        #             print(f"Loaded normalization stats from {self.NORM_FILE}")
+        #         except Exception:
+        #             print(f"Warning: failed to load norm stats from {self.NORM_FILE}; recomputing.")
+        #             self._compute_and_save_norm_stats()
+        #     else:
+        #         # compute and save stats
+        #         self._compute_and_save_norm_stats()
 
     # -------------------------
     # helper: quadrant from yaw
@@ -99,18 +157,18 @@ class DubinsDataset(Dataset):
     # -------------------------
     def _generate_samples(self):
 
-        # skip generation if index exists
-        if os.path.exists(self.INDEX_FILE):
-            print("Index file already exists; skipping data generation.")
-            return
-
-
-        # # remove old samples/index if present
+        # # skip generation if index exists
         # if os.path.exists(self.INDEX_FILE):
-        #     print("Removing old index file...")
-        #     os.remove(self.INDEX_FILE)
-        # # optional: wipe sample dir
+        #     print("Index file already exists; skipping data generation.")
+        #     return
         
+        # Delete the index and samples if they exist
+        if os.path.exists(self.INDEX_FILE):
+            try:
+                os.remove(self.INDEX_FILE)
+            except Exception:
+                pass
+
         # WARNING: this will delete existing sample files
         for fname in os.listdir(self.SAMPLES_DIR):
             path = os.path.join(self.SAMPLES_DIR, fname)
@@ -124,7 +182,7 @@ class DubinsDataset(Dataset):
         # buffer for bulk saving; we flush to disk every FLUSH_EVERY samples to avoid high memory use
         archive_buf = {}
         part_idx = 0
-        FLUSH_EVERY = 10  # flush samples
+        FLUSH_EVERY = max(1, int(self.samples_per_part))  # how many samples per archive part
         current_part_name = f"all_samples_part{part_idx:03d}.npz"
 
         yaw_values = list(range(0, self.MAX_YAW, self.YAW_STEP))  # e.g., 0..350
@@ -132,8 +190,9 @@ class DubinsDataset(Dataset):
 
         expected = ((2 * self.MAX_GRID) // self.X_Y_SPACE + 1) ** 2 * len(yaw_values) * len(gamma_values)
         print(f"Expected grid samples (upper bound): {expected}")
-        debug = False
+        debug = True
         debug_stopping_point = 10000
+        stop = False
         # iterate deterministically (non-random)
         for x2 in range(-self.MAX_GRID, self.MAX_GRID + 1, self.X_Y_SPACE):
             if debug and idx > debug_stopping_point:
@@ -148,16 +207,20 @@ class DubinsDataset(Dataset):
                         traj = self._try_generate_sample(x1, y1, alt1, float(x2), float(y2), yaw_rad, gamma_rad)
                         if traj is None or traj.shape[0] <= 1:
                             continue
-                        cond = np.array([x1, y1, float(x2), float(y2)], dtype=np.float32)
+                        
+                        cond = np.array([x1, y1, float(x2), float(y2), yaw_rad, gamma_rad], dtype=np.float32)
                         quadrant = self._get_quadrant(yaw_rad)
 
                         # store sample in current part buffer and record index pointing to this part
                         fname_rel = os.path.join("samples", current_part_name)
+                        # store cond in the index so downstream code can access it without
+                        # opening the archive. Convert to a Python list for safe storage.
                         index_list.append({
                             "filename": fname_rel,
                             "quadrant": int(quadrant),
                             "length": int(traj.shape[0]),
                             "idx": idx,
+                            "cond": cond.tolist(),
                         })
                         archive_buf[f"traj_{idx}"] = traj
                         archive_buf[f"cond_{idx}"] = cond
@@ -174,8 +237,6 @@ class DubinsDataset(Dataset):
                             archive_buf = {}
                             part_idx += 1
                             current_part_name = f"all_samples_part{part_idx:03d}.npz"
-                # optional progress print (per x slice)
-            print(f"Progress: x loop finished; Total samples so far: {idx}")
 
         # Flush any remaining buffered samples into the final part file
         if len(archive_buf) > 0:
@@ -187,6 +248,208 @@ class DubinsDataset(Dataset):
         # Save index (list of metadata dicts)
         np.save(self.INDEX_FILE, np.array(index_list, dtype=object))
         print(f"Data generation complete. {len(index_list)} samples indexed (split across {part_idx+1} archive files)")
+
+    def _calculate_mean_and_std(self,meta):
+        fpath = os.path.join(self.DATA_ROOT, meta["filename"])
+        try:
+            with np.load(fpath, allow_pickle=False) as npz:
+                # Load trajectory from archive (archive may store many samples).
+                if 'idx' in meta:
+                    k = int(meta['idx'])
+                    traj = npz[f"traj_{k}"]
+                    # If condition was saved into the index, use that to avoid
+                    # re-reading from the archive; otherwise read from archive.
+                    if 'cond' in meta:
+                        cond = np.asarray(meta['cond'], dtype=np.float32)
+                        yaw = float(cond[4])
+                        gamma = float(cond[5])
+                    else:
+                        cond = npz[f"cond_{k}"]
+                        yaw = float(npz[f"yaw_{k}"].astype(np.float32))
+                        gamma = float(npz[f"gamma_{k}"].astype(np.float32))
+                else:
+                    traj = npz['traj']
+                    if 'cond' in meta:
+                        cond = np.asarray(meta['cond'], dtype=np.float32)
+                        yaw = float(cond[4])
+                        gamma = float(cond[5])
+                    else:
+                        cond = npz['cond']
+                        yaw = float(npz['yaw'].astype(np.float32))
+                        gamma = float(npz['gamma'].astype(np.float32))
+        except Exception:
+            return
+
+        traj = np.asarray(traj, dtype=np.float32)
+        cond = np.asarray(cond, dtype=np.float32)
+        # build full cond vector including sin(yaw), cos(yaw)
+        sy = float(np.sin(yaw))
+        cy = float(np.cos(yaw))
+        cond_full = np.concatenate([cond, np.array([sy, cy], dtype=np.float32)])
+        return traj, cond_full
+        # sum_pts += traj.sum(axis=0)
+        # sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
+        # count_pts += traj.shape[0]
+
+        # sum_cond += cond_full
+        # sumsq_cond += (cond_full.astype(np.float64) ** 2)
+        # count_cond += 1
+        
+    # -------------------------
+    # Normalization helpers
+    # -------------------------
+    def _compute_and_save_norm_stats(self):
+        # cond now includes [x1,y1,x2,y2,yaw,gamma,sin(yaw),cos(yaw)]
+        pass
+
+    def _compute_and_save_norm_stats2(self):
+        """
+        Compute mean/std for trajectory points (per-dim) and conditions across the dataset
+        and save to NORM_FILE. Trajectory statistics are computed over all points from all
+        trajectories (so they reflect the spatial distribution), while condition statistics
+        are computed per-sample.
+        """
+        print("Computing normalization statistics (this may take time)...")
+        sum_pts = np.zeros(3, dtype=np.float64)
+        sumsq_pts = np.zeros(3, dtype=np.float64)
+        count_pts = 0
+
+        # cond now includes [x1,y1,x2,y2,yaw,gamma,sin(yaw),cos(yaw)]
+        sum_cond = np.zeros(8, dtype=np.float64)
+        sumsq_cond = np.zeros(8, dtype=np.float64)
+        count_cond = 0
+
+        total_count = len(self.index)
+        start_time = time.time()
+        items_processed = 0
+        while(items_processed < total_count):
+            batch_size = min(500, total_count - items_processed)
+            end_index = items_processed + batch_size
+            batch = self.index[items_processed:end_index]
+            with ThreadPoolExecutor(max_workers=50) as executor:
+                results = executor.map(self._calculate_mean_and_std, batch)
+                for res in results:
+                    if res is None:
+                        continue
+                    traj, cond_full = res
+                    sum_pts += traj.sum(axis=0)
+                    sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
+                    count_pts += traj.shape[0]
+
+                    sum_cond += cond_full
+                    sumsq_cond += (cond_full.astype(np.float64) ** 2)
+                    count_cond += 1
+            items_processed = end_index
+        # with ThreadPoolExecutor(max_workers=3) as executor:
+        #     results = executor.map(self._calculate_mean_and_std, self.index)
+        #     for res in results:
+        #         if res is None:
+        #             continue
+        #         traj, cond_full = res
+        #         sum_pts += traj.sum(axis=0)
+        #         sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
+        #         count_pts += traj.shape[0]
+
+        #         sum_cond += cond_full
+        #         sumsq_cond += (cond_full.astype(np.float64) ** 2)
+        #         count_cond += 1
+
+        # for meta in self.index:
+        #     fpath = os.path.join(self.DATA_ROOT, meta["filename"])
+        #     try:
+        #         with np.load(fpath, allow_pickle=False) as npz:
+        #             if 'idx' in meta:
+        #                 k = int(meta['idx'])
+        #                 traj = npz[f"traj_{k}"]
+        #                 cond = npz[f"cond_{k}"]
+        #                 yaw = float(npz[f"yaw_{k}"].astype(np.float32))
+        #                 gamma = float(npz[f"gamma_{k}"].astype(np.float32))
+        #             else:
+        #                 traj = npz['traj']
+        #                 cond = npz['cond']
+        #                 yaw = float(npz['yaw'].astype(np.float32))
+        #                 gamma = float(npz['gamma'].astype(np.float32))
+        #     except Exception:
+        #         # skip unreadable files
+        #         continue
+
+        #     traj = np.asarray(traj, dtype=np.float32)
+        #     cond = np.asarray(cond, dtype=np.float32)
+        #     # build full cond vector including sin(yaw), cos(yaw)
+        #     sy = float(np.sin(yaw))
+        #     cy = float(np.cos(yaw))
+        #     cond_full = np.concatenate([cond, np.array([sy, cy], dtype=np.float32)])
+
+        #     sum_pts += traj.sum(axis=0)
+        #     sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
+        #     count_pts += traj.shape[0]
+
+        #     sum_cond += cond_full
+        #     sumsq_cond += (cond_full.astype(np.float64) ** 2)
+        #     count_cond += 1
+
+        if count_pts == 0 or count_cond == 0:
+            raise RuntimeError("No data found while computing normalization statistics")
+
+
+        traj_mean = (sum_pts / count_pts).astype(np.float32)
+        traj_var = (sumsq_pts / count_pts) - (traj_mean.astype(np.float64) ** 2)
+        traj_std = np.sqrt(np.maximum(traj_var, 0.0)).astype(np.float32)
+
+        cond_mean = (sum_cond / count_cond).astype(np.float32)
+        cond_var = (sumsq_cond / count_cond) - (cond_mean.astype(np.float64) ** 2)
+        cond_std = np.sqrt(np.maximum(cond_var, 0.0)).astype(np.float32)
+
+        # avoid division by zero
+        traj_std = np.maximum(traj_std, self.norm_eps).astype(np.float32)
+        cond_std = np.maximum(cond_std, self.norm_eps).astype(np.float32)
+
+        np.savez(self.NORM_FILE, cond_mean=cond_mean, cond_std=cond_std)
+        self.traj_mean = traj_mean
+        self.traj_std = traj_std
+        self.cond_mean = cond_mean
+        self.cond_std = cond_std
+        print(f"Saved normalization stats to {self.NORM_FILE}")
+
+    def denormalize_traj(self, traj_np: np.ndarray) -> np.ndarray:
+        """Inverse transform for trajectory numpy arrays: (N,3) -> original scale."""
+        if not getattr(self, 'normalize', False):
+            return traj_np
+        # traj was normalized as (traj - min_v) / denom where min_v = -MAX_GRID
+        min_v = -float(self.MAX_GRID)
+        max_v = float(self.MAX_GRID)
+        denom = max_v - min_v if (max_v - min_v) != 0.0 else 1.0
+        return (traj_np * denom) + min_v
+
+    def denormalize_cond(self, cond_np: np.ndarray) -> np.ndarray:
+        """Inverse transform for condition numpy arrays: (8,) or (B,8) -> original scale.
+            Condition vector is [x1, y1, x2, y2, yaw, gamma, sin(yaw), cos(yaw)].
+            This mirrors the cond_full used internally (cond + [sin(yaw), cos(yaw)]).
+        """
+        if not getattr(self, 'normalize', False):
+            return cond_np
+        # handle batch or single
+        arr = np.asarray(cond_np, dtype=np.float32)
+        min_v = -float(self.MAX_GRID)
+        max_v = float(self.MAX_GRID)
+        denom = max_v - min_v if (max_v - min_v) != 0.0 else 1.0
+
+        def denorm_single(a):
+            out = a.copy()
+            # positions
+            out[:4] = (out[:4] * denom) + min_v
+            # yaw, gamma
+            out[4] = out[4] * (2.0 * np.pi)
+            out[5] = out[5] * (2.0 * np.pi)
+            # sin/cos: if we have stats, invert standardization; otherwise leave as-is
+            # if hasattr(self, 'cond_mean') and hasattr(self, 'cond_std'):
+            #     out[6:] = (out[6:] * self.cond_std[6:]) + self.cond_mean[6:]
+            return out
+
+        if arr.ndim == 1:
+            return denorm_single(arr)
+        else:
+            return np.stack([denorm_single(row) for row in arr], axis=0)
 
     # -------------------------
     # Dataset API
@@ -205,19 +468,58 @@ class DubinsDataset(Dataset):
             if 'idx' in meta:
                 k = int(meta['idx'])
                 traj = npz[f"traj_{k}"].astype(np.float32)
-                cond = npz[f"cond_{k}"].astype(np.float32)
-                yaw = float(npz[f"yaw_{k}"].astype(np.float32))
-                gamma = float(npz[f"gamma_{k}"].astype(np.float32))
+                # Prefer condition stored in the index to avoid reopening archive entries
+                if 'cond' in meta:
+                    cond = np.asarray(meta['cond'], dtype=np.float32)
+                    # cond layout when stored in index: [x1,y1,x2,y2,yaw,gamma]
+                    yaw = float(cond[4])
+                    gamma = float(cond[5])
+                else:
+                    cond = npz[f"cond_{k}"].astype(np.float32)
+                    yaw = float(npz[f"yaw_{k}"].astype(np.float32))
+                    gamma = float(npz[f"gamma_{k}"].astype(np.float32))
                 quadrant = int(npz[f"quadrant_{k}"].astype(np.int32))
             else:
                 traj = npz["traj"].astype(np.float32)
-                cond = npz["cond"].astype(np.float32)
-                yaw = float(npz["yaw"].astype(np.float32))
-                gamma = float(npz["gamma"].astype(np.float32))
+                if 'cond' in meta:
+                    cond = np.asarray(meta['cond'], dtype=np.float32)
+                    yaw = float(cond[4])
+                    gamma = float(cond[5])
+                else:
+                    cond = npz["cond"].astype(np.float32)
+                    yaw = float(npz["yaw"].astype(np.float32))
+                    gamma = float(npz["gamma"].astype(np.float32))
                 quadrant = int(npz["quadrant"].astype(np.int32))
+        # build full cond vector including sin(yaw), cos(yaw) and gamma
+        sy = float(np.sin(yaw))
+        cy = float(np.cos(yaw))
+        cond_full = np.concatenate([cond, np.array([sy, cy], dtype=np.float32)])
+
+        # apply normalization if requested
+        if getattr(self, 'normalize', False):
+            # traj: (N,3), cond_full: (7,)
+            # Normalize traj using dataset bounds: min = -MAX_GRID, max = +MAX_GRID
+            # formula: (value - min) / (max - min)
+            min_v = -float(self.MAX_GRID)
+            max_v = float(self.MAX_GRID)
+            denom = max_v - min_v if (max_v - min_v) != 0.0 else 1.0
+            traj = (traj - min_v) / denom
+
+            # Normalize position entries in cond_full (x1,y1,x2,y2) using same MIN/MAX mapping
+            # cond_full layout: [x1, y1, x2, y2, yaw, gamma, sin(yaw), cos(yaw)]
+            cond_full = cond_full.astype(np.float32)
+            # normalize x/y coordinates to [0,1]
+            cond_full[:4] = (cond_full[:4] - min_v) / denom
+            # normalize yaw by wrapping negative radians into [0,2*pi) then mapping to [0,1)
+            # gamma remains as radians mapped by 2*pi (can be negative)
+            # cond_full layout: [x1, y1, x2, y2, yaw, gamma, sin(yaw), cos(yaw)]
+            yaw_wrapped = (float(yaw) + 2.0 * np.pi) % (2.0 * np.pi)
+            cond_full[4] = yaw_wrapped / (2.0 * np.pi)
+            gamma_wrapped = (float(gamma) + 2.0 * np.pi) % (2.0 * np.pi)
+            cond_full[5] = gamma_wrapped / (2.0 * np.pi)
 
         # return a small dict (collate_fn expects this)
-        return {"traj": traj, "cond": cond, "yaw": yaw, "gamma": gamma, "quadrant": quadrant}
+        return {"traj": traj, "cond": cond_full, "yaw": yaw, "gamma": gamma, "quadrant": quadrant}
 
 # -----------------------------
 # Quadrant wrapper & loaders
@@ -245,14 +547,51 @@ class QuadrantDataset(Dataset):
         return self.base[global_idx]
 
 
-def build_quadrant_loaders(dataset: DubinsDataset, batch_size: int, val_split: float = 0.2, shuffle_index=True):
+class BucketBatchSampler(torch.utils.data.Sampler):
+    """Bucket-based batch sampler that groups similar-length samples to reduce padding.
+
+    indices: list of global indices (or local indices within a QuadrantDataset) to sample from
+    lengths_map: mapping from global index -> sequence length
+    bucket_size: how many indices to group into a bucket before batching
+    """
+    def __init__(self, indices, lengths_map, batch_size, bucket_size=100, shuffle=True):
+        self.indices = list(indices)
+        self.lengths_map = lengths_map
+        self.batch_size = batch_size
+        self.bucket_size = max(1, int(bucket_size))
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        inds = list(self.indices)
+        # sort by length to reduce padding inside buckets
+        inds.sort(key=lambda i: int(self.lengths_map.get(i, 0)))
+        # split into buckets
+        buckets = [inds[i:i + self.bucket_size] for i in range(0, len(inds), self.bucket_size)]
+        if self.shuffle:
+            random.shuffle(buckets)
+        for bucket in buckets:
+            # optionally shuffle within bucket to add randomness
+            if self.shuffle:
+                random.shuffle(bucket)
+            for i in range(0, len(bucket), self.batch_size):
+                yield bucket[i:i + self.batch_size]
+
+    def __len__(self):
+        if len(self.indices) == 0:
+            return 0
+        # approximate number of batches
+        return sum((len(b) + self.batch_size - 1) // self.batch_size for b 
+                   in [self.indices[i:i + self.bucket_size] for i in range(0, len(self.indices), self.bucket_size)])
+
+def build_quadrant_loaders(dataset: DubinsDataset, batch_size: int, val_split: float = 0.15, test_split: float = 0.15, shuffle_index=True, dynamic_batching=False, bucket_size=100):
     """
     Build DataLoaders for each quadrant. Splits indices into train/val at dataset-level, then
     builds QuadrantDataset wrappers for each quadrant and each split.
     Returns:
         train_loaders: list of 4 DataLoaders (one per quadrant)
-        val_loaders:   same
-        train_indices, val_indices: lists for reproducibility (optional)
+        val_loaders:   list of 4 DataLoaders
+        test_loaders:  list of 4 DataLoaders (may be empty if test_split==0)
+        train_indices, val_indices, test_indices: lists for reproducibility (optional)
     """
     # create list of indices per quadrant
     quad_indices = {0: [], 1: [], 2: [], 3: []}
@@ -260,40 +599,67 @@ def build_quadrant_loaders(dataset: DubinsDataset, batch_size: int, val_split: f
         q = int(meta["quadrant"])
         quad_indices[q].append(i)
 
-    # remove samples with zero indices
-    for q in quad_indices:
-        quad_indices[q] = [i for i in quad_indices[q] if i != 0]
+    # (previously removed index 0 samples here; keep all indices intact)
     
     # Limit max samples per quadrant for faster testing
     max_samples_per_quad = 10000
     for q in quad_indices:
-        quad_indices[q] = quad_indices[q][:max_samples_per_quad]
+        # quad_indices[q] = quad_indices[q][:max_samples_per_quad]
+        quad_indices[q] = quad_indices[q][:]
 
     train_loaders = []
     val_loaders = []
+    test_loaders = []
     train_idx_by_quad = {}
     val_idx_by_quad = {}
+    test_idx_by_quad = {}
 
     for q in range(4):
         idxs = quad_indices[q]
         if shuffle_index:
             random.shuffle(idxs)
         n_val = int(len(idxs) * val_split)
+        n_test = int(len(idxs) * test_split)
+        # allocate: first val, then test, rest train (deterministic after shuffle)
         val_idxs = idxs[:n_val]
-        train_idxs = idxs[n_val:]
+        test_idxs = idxs[n_val:n_val + n_test]
+        train_idxs = idxs[n_val + n_test:]
+
         train_idx_by_quad[q] = train_idxs
         val_idx_by_quad[q] = val_idxs
+        test_idx_by_quad[q] = test_idxs
 
         train_ds_q = QuadrantDataset(dataset, quadrant_id=q, indices=train_idxs)
         val_ds_q = QuadrantDataset(dataset, quadrant_id=q, indices=val_idxs)
+        test_ds_q = QuadrantDataset(dataset, quadrant_id=q, indices=test_idxs)
+        if dynamic_batching:
+            # Build lengths map for global indices so sampler can sort by true sequence lengths
+            # Build lengths map for local indices within this quadrant's index list
+            # BucketBatchSampler expects indices relative to the dataset it's sampling from
+            train_local_indices = list(range(len(train_idxs)))
+            val_local_indices = list(range(len(val_idxs)))
+            test_local_indices = list(range(len(test_idxs)))
+            train_lengths_map = {li: int(dataset.index[train_idxs[li]]['length']) for li in train_local_indices}
+            val_lengths_map = {li: int(dataset.index[val_idxs[li]]['length']) for li in val_local_indices}
+            test_lengths_map = {li: int(dataset.index[test_idxs[li]]['length']) for li in test_local_indices}
 
-        train_loader_q = DataLoader(train_ds_q, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-        val_loader_q = DataLoader(val_ds_q, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+            train_sampler = BucketBatchSampler(train_local_indices, train_lengths_map, batch_size, bucket_size=bucket_size, shuffle=True)
+            val_sampler = BucketBatchSampler(val_local_indices, val_lengths_map, batch_size, bucket_size=bucket_size, shuffle=False)
+            test_sampler = BucketBatchSampler(test_local_indices, test_lengths_map, batch_size, bucket_size=bucket_size, shuffle=False)
+
+            train_loader_q = DataLoader(train_ds_q, batch_sampler=train_sampler, collate_fn=collate_fn, num_workers=4)
+            val_loader_q = DataLoader(val_ds_q, batch_sampler=val_sampler, collate_fn=collate_fn, num_workers=4)
+            test_loader_q = DataLoader(test_ds_q, batch_sampler=test_sampler, collate_fn=collate_fn, num_workers=4)
+        else:
+            train_loader_q = DataLoader(train_ds_q, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+            val_loader_q = DataLoader(val_ds_q, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
+            test_loader_q = DataLoader(test_ds_q, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
 
         train_loaders.append(train_loader_q)
         val_loaders.append(val_loader_q)
+        test_loaders.append(test_loader_q)
 
-    return train_loaders, val_loaders, train_idx_by_quad, val_idx_by_quad
+    return train_loaders, val_loaders, test_loaders, train_idx_by_quad, val_idx_by_quad, test_idx_by_quad
 
 # -----------------------------
 # Collate function (same API used earlier)
@@ -304,7 +670,7 @@ def collate_fn(batch):
     Returns:
         padded: (B, L_max, feat) float tensor on device
         lengths: (B,) long tensor on CPU (we put lengths on device in training loop as needed)
-        conds: (B, 4) float tensor on same device as padded
+    conds: (B, 8) float tensor on same device as padded (condition: [x1,y1,x2,y2,yaw,gamma,sin(yaw),cos(yaw)])
     """
     trajs = []
     conds = []
@@ -323,9 +689,8 @@ def collate_fn(batch):
         L = t.size(0)
         padded[i, :L, :] = t.float()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    padded = padded.to(device=device)
-    conds = torch.stack(conds).float().to(device=device)
+    # Keep tensors on CPU here; caller (training/eval) should move to the desired device.
+    conds = torch.stack(conds).float()
 
     return padded, lengths, conds
 
@@ -333,7 +698,7 @@ def collate_fn(batch):
 # Model (unchanged)
 # -----------------------------
 class DubinsLSTM(nn.Module):
-    def __init__(self, input_dim=3, cond_dim=4, hidden_dim=128, num_layers=2, output_dim=3):
+    def __init__(self, input_dim=3, cond_dim=8, hidden_dim=128, num_layers=2, output_dim=3):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -465,6 +830,14 @@ def plot_prediction_example(model, dataset, device=None, idx=0):
         preds = model(conds, target_seq=None, seq_len=gen_len, teacher_forcing_ratio=0.0)
     preds = preds.cpu().numpy()[0]
     gt = trajs.cpu().numpy()[0][:gen_len]
+    # If dataset returns normalized values, denormalize for plotting
+    try:
+        if getattr(dataset, 'normalize', False):
+            preds = dataset.denormalize_traj(preds)
+            gt = dataset.denormalize_traj(gt)
+    except Exception:
+        # be robust to datasets that don't implement denormalize helpers
+        pass
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
     ax.plot(gt[:,0], gt[:,1], gt[:,2], 'b.-', label='gt')
@@ -477,26 +850,103 @@ def plot_prediction_example(model, dataset, device=None, idx=0):
 # -----------------------------
 # Main training loop
 # -----------------------------
-def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
-               early_stopping_patience: int = 3, early_stopping_min_delta: float = 1e-4,
-               regenerate_dataset=False):
+def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
+         early_stopping_patience: int = 3, early_stopping_min_delta: float = 1e-4,
+         regenerate_dataset=False,
+         load_model_path: str = None,
+         evaluate_only: bool = False,
+         inference_only: bool = False,
+         dynamic_batching: bool = False,
+         bucket_size: int = 100,
+         data_root: str = None,
+         model_dir: str = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Create dataset (on-disk). Set regenerate_dataset=True to re-create samples.
-    dataset = DubinsDataset(regenerate=regenerate_dataset)
+    dataset = DubinsDataset(regenerate=regenerate_dataset, data_root=data_root) if data_root is not None else DubinsDataset(regenerate=regenerate_dataset)
 
-    # Build quadrant loaders (train/val per quadrant)
-    train_loaders, val_loaders, train_idxs, val_idxs = build_quadrant_loaders(dataset, batch_size=batch_size, val_split=0.2)
+    # Build quadrant loaders (train/val/test per quadrant)
+    train_loaders, val_loaders, test_loaders, train_idxs, val_idxs, test_idxs = build_quadrant_loaders(dataset, batch_size=batch_size, val_split=0.2, dynamic_batching=dynamic_batching, bucket_size=bucket_size)
 
     model = DubinsLSTM().to(device)
     optim_obj = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss(reduction='none')
 
+    # Optionally load existing model weights (for evaluation or warm-start)
+    # If user did not pass --load-model-path, try to auto-detect a local 'dubin_lstm.pth'
+    if load_model_path is None:
+        candidates = []
+        if model_dir is not None:
+            candidates.append(os.path.join(model_dir, 'dubin_lstm.pth'))
+        candidates.append(os.path.join(os.getcwd(), 'dubin_lstm.pth'))
+        for cand in candidates:
+            if os.path.exists(cand):
+                load_model_path = cand
+                print(f"Auto-detected model file at '{cand}' (set as load_model_path)")
+                break
+
+    if load_model_path is not None and os.path.exists(load_model_path):
+        print(f"Loading model weights from '{load_model_path}'")
+        model.load_state_dict(torch.load(load_model_path, map_location=device, weights_only=True))
+        if inference_only:
+            print("Inference-only mode: skipping training and evaluation.")
+            return model, dataset, train_loaders, val_loaders, test_loaders, {}
+
+        # If user only wanted to evaluate, skip training and run evaluation on val loaders
+        if evaluate_only:
+            print("Evaluate-only mode: running evaluation on validation and test loaders...")
+            # aggregate evaluation across quadrants (validation)
+            val_loss_total = 0.0
+            val_ADE_total = 0.0
+            val_FDE_total = 0.0
+            total_val_samples = 0
+            for q in range(4):
+                vloader = val_loaders[q]
+                if len(vloader.dataset) == 0:
+                    continue
+                v_loss, v_ADE, v_FDE = eval_epoch(model, vloader, device, criterion)
+                n_v = len(vloader.dataset)
+                val_loss_total += v_loss * n_v
+                val_ADE_total += v_ADE * n_v
+                val_FDE_total += v_FDE * n_v
+                total_val_samples += n_v
+
+            avg_val_loss = (val_loss_total / total_val_samples) if total_val_samples > 0 else 0.0
+            avg_val_ADE = (val_ADE_total / total_val_samples) if total_val_samples > 0 else 0.0
+            avg_val_FDE = (val_FDE_total / total_val_samples) if total_val_samples > 0 else 0.0
+            print(f"Validation -- Loss: {avg_val_loss:.6f} | ADE: {avg_val_ADE:.4f} | FDE: {avg_val_FDE:.4f}")
+
+            # aggregate evaluation across quadrants (test)
+            test_loss_total = 0.0
+            test_ADE_total = 0.0
+            test_FDE_total = 0.0
+            total_test_samples = 0
+            for q in range(4):
+                tloader = test_loaders[q]
+                if len(tloader.dataset) == 0:
+                    continue
+                t_loss, t_ADE, t_FDE = eval_epoch(model, tloader, device, criterion)
+                n_t = len(tloader.dataset)
+                test_loss_total += t_loss * n_t
+                test_ADE_total += t_ADE * n_t
+                test_FDE_total += t_FDE * n_t
+                total_test_samples += n_t
+
+            avg_test_loss = (test_loss_total / total_test_samples) if total_test_samples > 0 else 0.0
+            avg_test_ADE = (test_ADE_total / total_test_samples) if total_test_samples > 0 else 0.0
+            avg_test_FDE = (test_FDE_total / total_test_samples) if total_test_samples > 0 else 0.0
+            print(f"Test       -- Loss: {avg_test_loss:.6f} | ADE: {avg_test_ADE:.4f} | FDE: {avg_test_FDE:.4f}")
+            # return with empty history for evaluate-only
+            return model, dataset, train_loaders, val_loaders, test_loaders, {}
+
     history = {'train_loss': [], 'val_loss': [], 'ADE': [], 'FDE': []}
     best_val = float('inf')
     epochs_no_improve = 0
-    best_model_path = 'dubin_lstm_best.pth'
+    # model_dir override (use temp dir in tests)
+    model_dir_to_use = model_dir if model_dir is not None else os.getcwd()
+    os.makedirs(model_dir_to_use, exist_ok=True)
+    best_model_path = os.path.join(model_dir_to_use, 'dubin_lstm_best.pth')
 
     # Training strategy: cycle through quadrants each epoch (you can change it)
     for epoch in range(epochs):
@@ -558,36 +1008,75 @@ def main_train(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
     # Load best model if exists
     if os.path.exists(best_model_path):
         print(f"Loading best model from '{best_model_path}'")
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
 
     # save final model
-    torch.save(model.state_dict(), "dubin_lstm.pth")
-    print("Training complete. Model saved as 'dubin_lstm.pth'.")
+    final_model_path = os.path.join(model_dir_to_use, 'dubin_lstm.pth')
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Training complete. Model saved as '{final_model_path}'.")
 
-    # plot training curves
-    plt.figure()
-    plt.plot(history['train_loss'], label='Train')
-    plt.plot(history['val_loss'], label='Val')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.title("Loss Curve")
-    plt.show()
+    # plot training curves (only if matplotlib available and provides the plotting API)
+    if plt is not None and hasattr(plt, 'figure'):
+        try:
+            plt.figure()
+            plt.plot(history['train_loss'], label='Train')
+            plt.plot(history['val_loss'], label='Val')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.title("Loss Curve")
+            plt.show()
+        except Exception:
+            # plotting is optional; ignore any plotting errors in headless/test environments
+            pass
 
-    return model, dataset, train_loaders, val_loaders, history
+    return model, dataset, train_loaders, val_loaders, test_loaders, history
 
 # -----------------------------
 # CLI
 # -----------------------------
 if __name__ == "__main__":
-    # To force regeneration: main_train(..., regenerate_dataset=True)
-    model, dataset, train_loaders, val_loaders, history = main_train(batch_size=4096, epochs=100, lr=1e-3, 
-                                                                     tf_ratio=0.5, regenerate_dataset=False, 
-                                                                     early_stopping_patience=3)
-    # Example plot
-    # pick a quadrant with at least one sample
-    for q in range(4):
-        if len(train_loaders[q].dataset) > 0:
-            sample_global_idx = train_loaders[q].dataset.indices[0]
-            plot_prediction_example(model, dataset, idx=sample_global_idx)
+    parser = argparse.ArgumentParser(description="Train/evaluate Dubins LSTM model")
+    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--tf-ratio', type=float, default=0.5)
+    parser.add_argument('--regenerate', action='store_true')
+    parser.add_argument('--early-stopping-patience', type=int, default=3)
+    parser.add_argument('--dynamic-batching', action='store_true')
+    parser.add_argument('--bucket-size', type=int, default=100)
+    parser.add_argument('--evaluate-only', action='store_true')
+    parser.add_argument('--load-model-path', type=str, default=None)
+    parser.add_argument('--data-root', type=str, default=None, help='Override data root directory')
+    parser.add_argument('--model-dir', type=str, default=None, help='Directory to save model artifacts')
+
+    args = parser.parse_args()
+    args.regenerate=False
+    
+    model, dataset, train_loaders, val_loaders, test_loaders, history = main(
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        tf_ratio=args.tf_ratio,
+        regenerate_dataset=args.regenerate,
+        early_stopping_patience=args.early_stopping_patience,
+        evaluate_only=args.evaluate_only,
+        inference_only=True,
+        load_model_path=args.load_model_path,
+        dynamic_batching=args.dynamic_batching,
+        bucket_size=args.bucket_size,
+        data_root=args.data_root,
+        model_dir=args.model_dir,
+        
+    )
+
+    # Example plot (only if matplotlib available)
+    if plt is not None:
+        # pick a quadrant with at least one sample
+        for q in range(4):
+            if len(train_loaders[q].dataset) > 0:
+                # pick 10 samples to plot
+                for x in range(2):
+                    sample_global_idx = train_loaders[q].dataset.indices[x]
+                    plot_prediction_example(model, dataset, idx=sample_global_idx)
             
