@@ -16,7 +16,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from torchinfo import summary
-
+from dubin_lstm_encoder_decoder import DubinsLSTMEncoderDecoder
 
 try:
     import matplotlib.pyplot as plt
@@ -100,28 +100,6 @@ class DubinsDataset(Dataset):
         # load index (list of metadata dicts)
         self.index = np.load(self.INDEX_FILE, allow_pickle=True).tolist()
         print(f"Dataset contains {len(self.index)} samples (index loaded).")
-
-        # # If requested, compute or load normalization statistics
-        # if self.normalize:
-        #     if os.path.exists(self.NORM_FILE):
-        #         try:
-        #             with np.load(self.NORM_FILE) as npz:
-        #                 self.traj_mean = npz["traj_mean"]
-        #                 self.traj_std = npz["traj_std"]
-        #                 self.cond_mean = npz["cond_mean"]
-        #                 self.cond_std = npz["cond_std"]
-        #             # ensure arrays are numpy float32
-        #             self.traj_mean = self.traj_mean.astype(np.float32)
-        #             self.traj_std = self.traj_std.astype(np.float32)
-        #             self.cond_mean = self.cond_mean.astype(np.float32)
-        #             self.cond_std = self.cond_std.astype(np.float32)
-        #             print(f"Loaded normalization stats from {self.NORM_FILE}")
-        #         except Exception:
-        #             print(f"Warning: failed to load norm stats from {self.NORM_FILE}; recomputing.")
-        #             self._compute_and_save_norm_stats()
-        #     else:
-        #         # compute and save stats
-        #         self._compute_and_save_norm_stats()
 
     # -------------------------
     # helper: quadrant from yaw
@@ -252,168 +230,6 @@ class DubinsDataset(Dataset):
         # Save index (list of metadata dicts)
         np.save(self.INDEX_FILE, np.array(index_list, dtype=object))
         print(f"Data generation complete. {len(index_list)} samples indexed (split across {part_idx+1} archive files)")
-
-    def _calculate_mean_and_std(self,meta):
-        fpath = os.path.join(self.DATA_ROOT, meta["filename"])
-        try:
-            with np.load(fpath, allow_pickle=False) as npz:
-                # Load trajectory from archive (archive may store many samples).
-                if 'idx' in meta:
-                    k = int(meta['idx'])
-                    traj = npz[f"traj_{k}"]
-                    # If condition was saved into the index, use that to avoid
-                    # re-reading from the archive; otherwise read from archive.
-                    if 'cond' in meta:
-                        cond = np.asarray(meta['cond'], dtype=np.float32)
-                        yaw = float(cond[4])
-                        gamma = float(cond[5])
-                    else:
-                        cond = npz[f"cond_{k}"]
-                        yaw = float(npz[f"yaw_{k}"].astype(np.float32))
-                        gamma = float(npz[f"gamma_{k}"].astype(np.float32))
-                else:
-                    traj = npz['traj']
-                    if 'cond' in meta:
-                        cond = np.asarray(meta['cond'], dtype=np.float32)
-                        yaw = float(cond[4])
-                        gamma = float(cond[5])
-                    else:
-                        cond = npz['cond']
-                        yaw = float(npz['yaw'].astype(np.float32))
-                        gamma = float(npz['gamma'].astype(np.float32))
-        except Exception:
-            return
-
-        traj = np.asarray(traj, dtype=np.float32)
-        cond = np.asarray(cond, dtype=np.float32)
-        # build full cond vector including sin(yaw), cos(yaw)
-        sy = float(np.sin(yaw))
-        cy = float(np.cos(yaw))
-        cond_full = np.concatenate([cond, np.array([sy, cy], dtype=np.float32)])
-        return traj, cond_full
-        # sum_pts += traj.sum(axis=0)
-        # sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
-        # count_pts += traj.shape[0]
-
-        # sum_cond += cond_full
-        # sumsq_cond += (cond_full.astype(np.float64) ** 2)
-        # count_cond += 1
-        
-    # -------------------------
-    # Normalization helpers
-    # -------------------------
-    def _compute_and_save_norm_stats(self):
-        # cond now includes [x1,y1,x2,y2,yaw,gamma,sin(yaw),cos(yaw)]
-        pass
-
-    def _compute_and_save_norm_stats2(self):
-        """
-        Compute mean/std for trajectory points (per-dim) and conditions across the dataset
-        and save to NORM_FILE. Trajectory statistics are computed over all points from all
-        trajectories (so they reflect the spatial distribution), while condition statistics
-        are computed per-sample.
-        """
-        print("Computing normalization statistics (this may take time)...")
-        sum_pts = np.zeros(3, dtype=np.float64)
-        sumsq_pts = np.zeros(3, dtype=np.float64)
-        count_pts = 0
-
-        # cond now includes [x1,y1,x2,y2,yaw,gamma,sin(yaw),cos(yaw)]
-        sum_cond = np.zeros(8, dtype=np.float64)
-        sumsq_cond = np.zeros(8, dtype=np.float64)
-        count_cond = 0
-
-        total_count = len(self.index)
-        start_time = time.time()
-        items_processed = 0
-        while(items_processed < total_count):
-            batch_size = min(500, total_count - items_processed)
-            end_index = items_processed + batch_size
-            batch = self.index[items_processed:end_index]
-            with ThreadPoolExecutor(max_workers=50) as executor:
-                results = executor.map(self._calculate_mean_and_std, batch)
-                for res in results:
-                    if res is None:
-                        continue
-                    traj, cond_full = res
-                    sum_pts += traj.sum(axis=0)
-                    sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
-                    count_pts += traj.shape[0]
-
-                    sum_cond += cond_full
-                    sumsq_cond += (cond_full.astype(np.float64) ** 2)
-                    count_cond += 1
-            items_processed = end_index
-        # with ThreadPoolExecutor(max_workers=3) as executor:
-        #     results = executor.map(self._calculate_mean_and_std, self.index)
-        #     for res in results:
-        #         if res is None:
-        #             continue
-        #         traj, cond_full = res
-        #         sum_pts += traj.sum(axis=0)
-        #         sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
-        #         count_pts += traj.shape[0]
-
-        #         sum_cond += cond_full
-        #         sumsq_cond += (cond_full.astype(np.float64) ** 2)
-        #         count_cond += 1
-
-        # for meta in self.index:
-        #     fpath = os.path.join(self.DATA_ROOT, meta["filename"])
-        #     try:
-        #         with np.load(fpath, allow_pickle=False) as npz:
-        #             if 'idx' in meta:
-        #                 k = int(meta['idx'])
-        #                 traj = npz[f"traj_{k}"]
-        #                 cond = npz[f"cond_{k}"]
-        #                 yaw = float(npz[f"yaw_{k}"].astype(np.float32))
-        #                 gamma = float(npz[f"gamma_{k}"].astype(np.float32))
-        #             else:
-        #                 traj = npz['traj']
-        #                 cond = npz['cond']
-        #                 yaw = float(npz['yaw'].astype(np.float32))
-        #                 gamma = float(npz['gamma'].astype(np.float32))
-        #     except Exception:
-        #         # skip unreadable files
-        #         continue
-
-        #     traj = np.asarray(traj, dtype=np.float32)
-        #     cond = np.asarray(cond, dtype=np.float32)
-        #     # build full cond vector including sin(yaw), cos(yaw)
-        #     sy = float(np.sin(yaw))
-        #     cy = float(np.cos(yaw))
-        #     cond_full = np.concatenate([cond, np.array([sy, cy], dtype=np.float32)])
-
-        #     sum_pts += traj.sum(axis=0)
-        #     sumsq_pts += (traj.astype(np.float64) ** 2).sum(axis=0)
-        #     count_pts += traj.shape[0]
-
-        #     sum_cond += cond_full
-        #     sumsq_cond += (cond_full.astype(np.float64) ** 2)
-        #     count_cond += 1
-
-        if count_pts == 0 or count_cond == 0:
-            raise RuntimeError("No data found while computing normalization statistics")
-
-
-        traj_mean = (sum_pts / count_pts).astype(np.float32)
-        traj_var = (sumsq_pts / count_pts) - (traj_mean.astype(np.float64) ** 2)
-        traj_std = np.sqrt(np.maximum(traj_var, 0.0)).astype(np.float32)
-
-        cond_mean = (sum_cond / count_cond).astype(np.float32)
-        cond_var = (sumsq_cond / count_cond) - (cond_mean.astype(np.float64) ** 2)
-        cond_std = np.sqrt(np.maximum(cond_var, 0.0)).astype(np.float32)
-
-        # avoid division by zero
-        traj_std = np.maximum(traj_std, self.norm_eps).astype(np.float32)
-        cond_std = np.maximum(cond_std, self.norm_eps).astype(np.float32)
-
-        np.savez(self.NORM_FILE, cond_mean=cond_mean, cond_std=cond_std)
-        self.traj_mean = traj_mean
-        self.traj_std = traj_std
-        self.cond_mean = cond_mean
-        self.cond_std = cond_std
-        print(f"Saved normalization stats to {self.NORM_FILE}")
 
     def denormalize_traj(self, traj_np: np.ndarray) -> np.ndarray:
         """Inverse transform for trajectory numpy arrays: (N,3) -> original scale."""
@@ -549,7 +365,6 @@ class QuadrantDataset(Dataset):
         # map local idx -> global index
         global_idx = self.indices[idx]
         return self.base[global_idx]
-
 
 class BucketBatchSampler(torch.utils.data.Sampler):
     """Bucket-based batch sampler that groups similar-length samples to reduce padding.
@@ -864,7 +679,8 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
          dynamic_batching: bool = False,
          bucket_size: int = 100,
          data_root: str = None,
-         model_dir: str = None):
+         model_dir: str = None,
+         model_version: int = 1):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -874,7 +690,11 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
     # Build quadrant loaders (train/val/test per quadrant)
     train_loaders, val_loaders, test_loaders, train_idxs, val_idxs, test_idxs = build_quadrant_loaders(dataset, batch_size=batch_size, val_split=0.2, dynamic_batching=dynamic_batching, bucket_size=bucket_size)
 
-    model = DubinsLSTM().to(device)
+    if model_version == 1:
+        model = DubinsLSTM().to(device)
+    else:
+        model = DubinsLSTMEncoderDecoder().to(device)
+
     summary(model, input_size=(batch_size, 8))
     optim_obj = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss(reduction='none')
@@ -1057,7 +877,7 @@ if __name__ == "__main__":
     parser.add_argument('--model-dir', type=str, default=None, help='Directory to save model artifacts')
 
     args = parser.parse_args()
-    args.regenerate=True
+    args.regenerate=False
     
     model, dataset, train_loaders, val_loaders, test_loaders, history = main(
         batch_size=args.batch_size,
@@ -1073,7 +893,7 @@ if __name__ == "__main__":
         bucket_size=args.bucket_size,
         data_root=args.data_root,
         model_dir=args.model_dir,
-        
+        model_version=1
     )
 
     # Example plot (only if matplotlib available)
