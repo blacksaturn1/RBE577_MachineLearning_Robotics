@@ -13,17 +13,17 @@ This folder (hw3) contains code and tests for a Dubins-like trajectory predictio
   - `collate_fn(batch)` pads trajectories to the batch max length and returns:
     - padded trajectories: Tensor (B, L_max, 3)
     - lengths: LongTensor (B,)
-    - conds: Tensor (B, 6)  — condition vector is now [x1, y1, x2, y2, yaw, gamma]
+    - conds: Tensor (B, 8)  — condition vector is now [x1, y1, x2, y2, yaw, gamma, sin(yaw), cos(yaw)]
   - The collate function keeps tensors on CPU; training/eval routines move tensors to the selected device.
 
 - Condition vector extended (yaw & gamma)
-  - Condition arrays now include yaw and gamma in addition to [x1, y1, x2, y2]. The condition vector is 6-dimensional.
-  - `DubinsLSTM` default `cond_dim` has been updated to 6 so the model accepts the expanded condition vector.
+  - Condition arrays now include yaw and gamma in addition to [x1, y1, x2, y2]. The dataset exposes a 6-value `cond` in the index/archives (`[x1,y1,x2,y2,yaw,gamma]`) but the dataset builds a full 8-dimensional `cond_full` by appending the trigonometric embedding (`[sin(yaw), cos(yaw)]`) before returning samples.
+  - `DubinsLSTM` default `cond_dim` has been updated to 8 so the model accepts the expanded condition vector (`cond_full`).
 
 - Normalization support
   - `DubinsDataset(regenerate=False, data_root=..., normalize=True)` computes (or loads) normalization statistics and returns normalized trajectories and condition vectors.
   - Normalization statistics are saved to `data/norm_stats.npz` with keys: `traj_mean`, `traj_std`, `cond_mean`, `cond_std`.
-  - Trajectory statistics are computed over all points from all trajectories (per-dimension mean/std for 3 dims). Condition statistics are computed per-sample over the 6-dim cond vector.
+  - Trajectory statistics are computed over all points from all trajectories (per-dimension mean/std for 3 dims). Condition statistics are computed per-sample over the 8-dim `cond_full` vector (positions, angles, and trig embedding).
   - Zero-variance values (e.g., constant yaw/gamma) are clipped to `norm_eps` to avoid division-by-zero.
   - Helpers: `denormalize_traj()` and `denormalize_cond()` are provided to invert normalization for plotting or evaluation.
 
@@ -37,7 +37,7 @@ This folder (hw3) contains code and tests for a Dubins-like trajectory predictio
   - `build_quadrant_loaders(..., dynamic_batching=True, bucket_size=...)` will build DataLoaders using `BucketBatchSampler` for each split.
 
 - Model and training
-  - `DubinsLSTM` takes condition vectors (B,6) and produces trajectory sequences. The internal `fc_cond` projects condition vectors to an embedding that's concatenated to the LSTM input at each step.
+  - `DubinsLSTM` takes condition vectors (B,8) (the `cond_full` vector including sin/cos) and produces trajectory sequences. The internal `fc_cond` projects condition vectors to an embedding that's concatenated to the LSTM input at each step.
   - Training/evaluation helpers `train_epoch()` and `eval_epoch()` implement masked MSE loss (ignoring padded timesteps) and compute ADE/FDE metrics.
   - Early stopping and saving: `main()` includes early stopping logic and saves best/final model weights to the provided `model_dir` (or CWD by default).
 
@@ -50,7 +50,7 @@ This folder (hw3) contains code and tests for a Dubins-like trajectory predictio
 
 - Tests
   - Unit tests live under `hw3/src/` (e.g., `test_collate.py`, `test_train_step.py`, `test_loader_splits.py`, `test_dynamic_batching.py`, `test_main_return.py`, `test_normalization.py`).
-  - Tests were updated to use the new 6-dim condition vectors where they construct in-memory batches.
+  - Tests were updated to use the new 8-dim `cond_full` vectors where they construct in-memory batches.
   - `test_normalization.py` creates a tiny on-disk archive and index inside a pytest `tmp_path` and asserts normalization statistics and denormalization behavior (yaw/gamma zero-variance -> std clipped to `norm_eps`).
 
 ## Usage examples
@@ -60,6 +60,67 @@ This folder (hw3) contains code and tests for a Dubins-like trajectory predictio
 ```bash
 python3 hw3/src/dubins_train.py --data-root ./data --model-dir ./models --epochs 10 --batch-size 64
 ```
+
+## TensorBoard logging
+
+The training script now writes TensorBoard logs automatically when it can create a writer. By default the writer writes into a `runs/` subdirectory under the `--model-dir` you pass (or the current working directory if you don't pass `--model-dir`). The layout is:
+
+```
+<model_dir_or_cwd>/runs/<YYYYMMDD-HHMMSS>/
+```
+
+Logged scalars (per epoch):
+- `train/epoch_loss` — average training loss for the epoch
+- `val/epoch_loss`   — average validation loss for the epoch
+- `val/ADE`         — validation ADE (average displacement error)
+- `val/FDE`         — validation FDE (final displacement error)
+
+Example: run training and view logs with TensorBoard
+
+```bash
+# run training, saving model artifacts and logs under ./models
+python3 hw3/src/dubins_train.py --data-root ./data --model-dir ./models --epochs 20 --batch-size 64
+
+# then in another terminal start TensorBoard pointing at the runs directory
+tensorboard --logdir ./models/runs
+
+# open http://localhost:6006 in your browser
+```
+
+Notes:
+- If the script cannot create a TensorBoard writer (rare), training will continue without logging; no extra CLI flag is required to enable logging.
+- The README currently documents epoch-level logging only. If you want batch-level logging or gradient/parameter histograms added, I can extend the code and README with examples.
+
+### CLI flags for histogram logging
+
+The training CLI exposes two flags to control histogram logging:
+
+- `--hist-interval N` : log parameter/gradient histograms every N epochs (default: 2). Set to `0` to disable.
+- `--no-histograms` : shorthand to disable histogram logging entirely.
+
+Examples:
+
+```bash
+# default: histograms every 2 epochs
+python3 hw3/src/dubins_train.py --model-dir ./models
+
+# disable histograms
+python3 hw3/src/dubins_train.py --model-dir ./models --no-histograms
+
+# log histograms every 5 epochs
+python3 hw3/src/dubins_train.py --model-dir ./models --hist-interval 5
+```
+
+Histogram placement in TensorBoard
+---------------------------------
+
+Histogram entries are grouped under the `params/` and `grads/` prefixes in TensorBoard. Each parameter name from the model is converted to a tag by replacing dots with slashes. Examples you may see in the TB UI:
+
+- `params/lstm/weight_ih_l0`
+- `params/lstm/bias_hh_l0`
+- `grads/lstm/weight_ih_l0`
+
+Use the TensorBoard Scalars and Histograms tabs to inspect training dynamics and gradient flow.
 
 - Create a dataset on disk
   - The repository expects either a pre-built `data/index.npy` and archived samples in `data/samples/`, or you can implement generation by setting `regenerate=True` and providing generation logic. Note: in this workspace the `_generate_samples()` method currently raises a clear RuntimeError (the generation routine was intentionally left out/disabled). If you need dataset generation, I can re-implement it.
@@ -72,17 +133,17 @@ from hw3.src.dubins_train import DubinsDataset
 ds = DubinsDataset(regenerate=False, data_root='data', normalize=True)
 item = ds[0]
 traj_norm = item['traj']   # (N,3) normalized
-cond_norm = item['cond']   # (6,) normalized
+cond_norm = item['cond']   # (8,) normalized (cond_full: [x1,y1,x2,y2,yaw,gamma,sin(yaw),cos(yaw)])
 # To denormalize:
 traj_orig = ds.denormalize_traj(traj_norm)
 cond_orig = ds.denormalize_cond(cond_norm)
 ```
 
 - Collate API (for custom DataLoader use)
-  - `collate_fn(batch)` expects list of items where `item['traj']` is an (N,3) np.ndarray and `item['cond']` is (6,) np.ndarray. Returns (padded_trajs, lengths, conds).
+  - `collate_fn(batch)` expects list of items where `item['traj']` is an (N,3) np.ndarray and `item['cond']` is (8,) np.ndarray (`cond_full`). Returns (padded_trajs, lengths, conds).
 
 - Model
-  - Instantiate model: `model = DubinsLSTM()` (defaults: cond_dim=6). Forward signature:
+  - Instantiate model: `model = DubinsLSTM()` (defaults: cond_dim=8). Forward signature:
 
 ```python
 preds = model(conds, target_seq=trajs, lengths=lengths, teacher_forcing_ratio=0.5)

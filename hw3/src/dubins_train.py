@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from torchinfo import summary
 from dubin_lstm_encoder_decoder import DubinsLSTMEncoderDecoder
+from torch.utils.tensorboard import SummaryWriter
 
 try:
     import matplotlib.pyplot as plt
@@ -526,7 +527,7 @@ class DubinsLSTM(nn.Module):
         self.lstm = nn.LSTM(input_dim + hidden_dim, hidden_dim, num_layers, batch_first=True)
         self.fc_out = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, conds, target_seq=None, lengths=None, teacher_forcing_ratio=0.0, 
+    def forward(self, conds, target_seq=None, lengths=None, teacher_forcing_ratio=0.5, 
                 seq_len: int = 50):
         B = conds.size(0)
         device = conds.device
@@ -573,6 +574,10 @@ def FDE(pred, gt):
     return torch.mean(torch.norm(pred[:, -1] - gt[:, -1], dim=-1))
 
 def train_epoch(model, loader, optim_obj, device, criterion, teacher_forcing=0.0, clip_grad=1.0):
+    """
+    Train for one epoch over the provided loader.
+    Returns: avg_loss
+    """
     model.train()
     running_loss = 0.0
     for trajs, lengths, conds in loader:
@@ -596,9 +601,14 @@ def train_epoch(model, loader, optim_obj, device, criterion, teacher_forcing=0.0
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         optim_obj.step()
         running_loss += float(loss.item()) * trajs.size(0)
-    return running_loss / len(loader.dataset) if len(loader.dataset) > 0 else 0.0
+
+    avg = running_loss / len(loader.dataset) if len(loader.dataset) > 0 else 0.0
+    return avg
 
 def eval_epoch(model, loader, device, criterion):
+    """
+    Evaluate model on loader. Returns: (avg_loss, avg_ADE, avg_FDE)
+    """
     model.eval()
     running_loss = 0.0
     total_ADE = 0.0
@@ -632,8 +642,12 @@ def eval_epoch(model, loader, device, criterion):
             last_gt = trajs[batch_idx, idx, :]
             fde_per = torch.norm(last_preds - last_gt, dim=-1)
             total_FDE += float(fde_per.sum().item())
+
     n = len(loader.dataset)
-    return (running_loss / n if n > 0 else 0.0), (total_ADE / n if n > 0 else 0.0), (total_FDE / n if n > 0 else 0.0)
+    avg_loss = (running_loss / n if n > 0 else 0.0)
+    avg_ADE = (total_ADE / n if n > 0 else 0.0)
+    avg_FDE = (total_FDE / n if n > 0 else 0.0)
+    return avg_loss, avg_ADE, avg_FDE
 
 # -----------------------------
 # Plotting helper
@@ -680,7 +694,9 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
          bucket_size: int = 100,
          data_root: str = None,
          model_dir: str = None,
-         model_version: int = 1):
+         model_version: int = 1,
+         hist_interval: int = 2,
+         histograms_enabled: bool = True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -695,9 +711,20 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
     else:
         model = DubinsLSTMEncoderDecoder().to(device)
 
-    summary(model, input_size=(batch_size, 8))
+    # summary(model, input_size=(batch_size, 8))
     optim_obj = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss(reduction='none')
+
+    # Prepare TensorBoard writer (logs go under model_dir or cwd)
+    model_dir_to_use = model_dir if model_dir is not None else os.getcwd()
+    os.makedirs(model_dir_to_use, exist_ok=True)
+    try:
+        log_subdir = os.path.join(model_dir_to_use, 'runs', time.strftime("%Y%m%d-%H%M%S"))
+        writer = SummaryWriter(log_dir=log_subdir)
+    except Exception:
+        writer = None
+    # effective histogram interval; set to 0 to disable
+    effective_hist_interval = int(hist_interval) if histograms_enabled else 0
 
     # Optionally load existing model weights (for evaluation or warm-start)
     # If user did not pass --load-model-path, try to auto-detect a local 'dubin_lstm.pth'
@@ -717,6 +744,11 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
         model.load_state_dict(torch.load(load_model_path, map_location=device, weights_only=True))
         if inference_only:
             print("Inference-only mode: skipping training and evaluation.")
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
             return model, dataset, train_loaders, val_loaders, test_loaders, {}
 
         # If user only wanted to evaluate, skip training and run evaluation on val loaders
@@ -770,8 +802,7 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
     best_val = float('inf')
     epochs_no_improve = 0
     # model_dir override (use temp dir in tests)
-    model_dir_to_use = model_dir if model_dir is not None else os.getcwd()
-    os.makedirs(model_dir_to_use, exist_ok=True)
+    # model_dir_to_use was created above when initializing the writer
     best_model_path = os.path.join(model_dir_to_use, 'dubin_lstm_best.pth')
 
     # Training strategy: cycle through quadrants each epoch (you can change it)
@@ -818,6 +849,42 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
 
         print(f"[{epoch+1:02d}/{epochs}] Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | ADE: {avg_val_ADE:.4f} | FDE: {avg_val_FDE:.4f}")
 
+        # TensorBoard: log epoch-level scalars
+        if writer is not None:
+            try:
+                writer.add_scalar('train/epoch_loss', avg_train_loss, epoch)
+                writer.add_scalar('val/epoch_loss', avg_val_loss, epoch)
+                writer.add_scalar('val/ADE', avg_val_ADE, epoch)
+                writer.add_scalar('val/FDE', avg_val_FDE, epoch)
+                writer.flush()
+                # Log parameter and gradient histograms (every `hist_interval` epochs)
+                try:
+                    if (hist_interval is not None) and (hist_interval > 0) and (epoch % hist_interval == 0):
+                        for name, param in model.named_parameters():
+                            # replace dots with slashes for nicer grouping in TB UI
+                            tag = name.replace('.', '/')
+                            try:
+                                writer.add_histogram(f'params/{tag}', param.data.cpu().numpy(), epoch)
+                            except Exception:
+                                # fallback to tensor input if numpy conversion fails
+                                try:
+                                    writer.add_histogram(f'params/{tag}', param.data.cpu(), epoch)
+                                except Exception:
+                                    pass
+                            if param.grad is not None:
+                                try:
+                                    writer.add_histogram(f'grads/{tag}', param.grad.data.cpu().numpy(), epoch)
+                                except Exception:
+                                    try:
+                                        writer.add_histogram(f'grads/{tag}', param.grad.data.cpu(), epoch)
+                                    except Exception:
+                                        pass
+                except Exception:
+                    # avoid crashing training if histogram logging fails
+                    pass
+            except Exception:
+                pass
+
         if avg_val_loss < best_val - early_stopping_min_delta:
             best_val = avg_val_loss
             epochs_no_improve = 0
@@ -856,6 +923,13 @@ def main(batch_size=64, epochs=10, lr=1e-3, tf_ratio=0.5,
             # plotting is optional; ignore any plotting errors in headless/test environments
             pass
 
+    # Close TensorBoard writer if present
+    if 'writer' in locals() and writer is not None:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
     return model, dataset, train_loaders, val_loaders, test_loaders, history
 
 # -----------------------------
@@ -875,6 +949,8 @@ if __name__ == "__main__":
     parser.add_argument('--load-model-path', type=str, default=None)
     parser.add_argument('--data-root', type=str, default=None, help='Override data root directory')
     parser.add_argument('--model-dir', type=str, default=None, help='Directory to save model artifacts')
+    parser.add_argument('--hist-interval', type=int, default=2, help='Epoch interval for histogram logging (0 to disable)')
+    parser.add_argument('--no-histograms', action='store_true', help='Disable histogram logging')
 
     args = parser.parse_args()
     args.regenerate=False
@@ -893,7 +969,9 @@ if __name__ == "__main__":
         bucket_size=args.bucket_size,
         data_root=args.data_root,
         model_dir=args.model_dir,
-        model_version=1
+        hist_interval=args.hist_interval,
+        histograms_enabled=(not args.no_histograms),
+        model_version=2
     )
 
     # Example plot (only if matplotlib available)

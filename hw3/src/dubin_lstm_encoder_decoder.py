@@ -10,7 +10,7 @@ from torchvision import models
 from torchinfo import summary
 
 class DubinsLSTMEncoderDecoder(nn.Module):
-    def __init__(self, input_dim=3, cond_dim=8, hidden_dim=64, num_layers=4, output_dim=3):
+    def __init__(self, input_dim=3, cond_dim=8, hidden_dim=64, num_layers=6, output_dim=3):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -34,8 +34,8 @@ class DubinsLSTMEncoderDecoder(nn.Module):
         else:
             run_len = seq_len
         # Initialize hidden and cell states from cond_embed
-        h = cond_embed[:,:self.hidden_dim ].repeat(self.num_layers, 1, 1)  # (num_layers, B, hidden_dim)
-        c = cond_embed[:,self.hidden_dim:].repeat(self.num_layers, 1, 1)  # (num_layers, B, hidden_dim)
+        h = cond_embed[:,:,:self.hidden_dim ].squeeze(1).repeat(self.num_layers, 1, 1)
+        c = cond_embed[:,:,self.hidden_dim:].squeeze(1).repeat(self.num_layers, 1, 1)  # (num_layers, B, hidden_dim)
 
         # h = torch.zeros(self.num_layers, B, self.hidden_dim, device=device)
         # c = torch.zeros(self.num_layers, B, self.hidden_dim, device=device)
